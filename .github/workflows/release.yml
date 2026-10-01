@@ -49,12 +49,3 @@ jobs:
             larp-music-player-linux-x86_64.tar.gz
             larp-music-player-linux-x86_64.tar.gz.sha256
           generate_release_notes: true
-          body: |
-            ## larp-music-player
-
-            TUI music player. Extract the archive and run the binary; keep `ytmeta.py` next to it (metadata helper).
-
-            ```
-            tar -xzf larp-music-player-linux-x86_64.tar.gz
-            ./larp-music-player
-            ```
