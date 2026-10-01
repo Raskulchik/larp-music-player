@@ -1,13 +1,13 @@
+use crate::api::Track;
 use crate::dlog;
+use mpris_server::zbus::Result as ZResult;
+use mpris_server::{
+    LoopStatus, Metadata, PlaybackRate, PlaybackStatus, PlayerInterface, Property, RootInterface,
+    Server, Time, TrackId, Uri, Volume,
+};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
-use mpris_server::zbus::Result as ZResult;
-use mpris_server::{
-    Server, Metadata, Time, Volume, PlaybackStatus, LoopStatus, PlaybackRate,
-    PlayerInterface, RootInterface, Property, Uri, TrackId,
-};
-use crate::api::Track;
 
 #[derive(Debug, Clone)]
 pub enum MprisCommand {
@@ -51,21 +51,45 @@ struct MprisHandler {
 }
 
 impl RootInterface for MprisHandler {
-    async fn raise(&self) -> mpris_server::zbus::fdo::Result<()> { Ok(()) }
-    async fn quit(&self) -> mpris_server::zbus::fdo::Result<()> { Ok(()) }
-    async fn can_quit(&self) -> mpris_server::zbus::fdo::Result<bool> { Ok(false) }
-    async fn fullscreen(&self) -> mpris_server::zbus::fdo::Result<bool> { Ok(false) }
-    async fn set_fullscreen(&self, _: bool) -> ZResult<()> { Ok(()) }
-    async fn can_set_fullscreen(&self) -> mpris_server::zbus::fdo::Result<bool> { Ok(false) }
-    async fn can_raise(&self) -> mpris_server::zbus::fdo::Result<bool> { Ok(false) }
-    async fn has_track_list(&self) -> mpris_server::zbus::fdo::Result<bool> { Ok(false) }
-    async fn identity(&self) -> mpris_server::zbus::fdo::Result<String> { Ok("Music Player TUI".into()) }
-    async fn desktop_entry(&self) -> mpris_server::zbus::fdo::Result<String> { Ok("larp-music-player".into()) }
+    async fn raise(&self) -> mpris_server::zbus::fdo::Result<()> {
+        Ok(())
+    }
+    async fn quit(&self) -> mpris_server::zbus::fdo::Result<()> {
+        Ok(())
+    }
+    async fn can_quit(&self) -> mpris_server::zbus::fdo::Result<bool> {
+        Ok(false)
+    }
+    async fn fullscreen(&self) -> mpris_server::zbus::fdo::Result<bool> {
+        Ok(false)
+    }
+    async fn set_fullscreen(&self, _: bool) -> ZResult<()> {
+        Ok(())
+    }
+    async fn can_set_fullscreen(&self) -> mpris_server::zbus::fdo::Result<bool> {
+        Ok(false)
+    }
+    async fn can_raise(&self) -> mpris_server::zbus::fdo::Result<bool> {
+        Ok(false)
+    }
+    async fn has_track_list(&self) -> mpris_server::zbus::fdo::Result<bool> {
+        Ok(false)
+    }
+    async fn identity(&self) -> mpris_server::zbus::fdo::Result<String> {
+        Ok("Music Player TUI".into())
+    }
+    async fn desktop_entry(&self) -> mpris_server::zbus::fdo::Result<String> {
+        Ok("larp-music-player".into())
+    }
     async fn supported_uri_schemes(&self) -> mpris_server::zbus::fdo::Result<Vec<String>> {
         Ok(vec!["http".into(), "https".into(), "file".into()])
     }
     async fn supported_mime_types(&self) -> mpris_server::zbus::fdo::Result<Vec<String>> {
-        Ok(vec!["audio/mpeg".into(), "audio/x-flac".into(), "audio/ogg".into()])
+        Ok(vec![
+            "audio/mpeg".into(),
+            "audio/x-flac".into(),
+            "audio/ogg".into(),
+        ])
     }
 }
 
@@ -94,19 +118,41 @@ impl PlayerInterface for MprisHandler {
         let _ = self.cmd_tx.send(MprisCommand::Resume);
         Ok(())
     }
-    async fn seek(&self, _offset: Time) -> mpris_server::zbus::fdo::Result<()> { Ok(()) }
-    async fn set_position(&self, _track_id: TrackId, _position: Time) -> mpris_server::zbus::fdo::Result<()> { Ok(()) }
-    async fn open_uri(&self, _uri: Uri) -> mpris_server::zbus::fdo::Result<()> { Ok(()) }
+    async fn seek(&self, _offset: Time) -> mpris_server::zbus::fdo::Result<()> {
+        Ok(())
+    }
+    async fn set_position(
+        &self,
+        _track_id: TrackId,
+        _position: Time,
+    ) -> mpris_server::zbus::fdo::Result<()> {
+        Ok(())
+    }
+    async fn open_uri(&self, _uri: Uri) -> mpris_server::zbus::fdo::Result<()> {
+        Ok(())
+    }
 
     async fn playback_status(&self) -> mpris_server::zbus::fdo::Result<PlaybackStatus> {
         Ok(self.state.read().await.playback_status)
     }
-    async fn loop_status(&self) -> mpris_server::zbus::fdo::Result<LoopStatus> { Ok(LoopStatus::None) }
-    async fn set_loop_status(&self, _: LoopStatus) -> ZResult<()> { Ok(()) }
-    async fn rate(&self) -> mpris_server::zbus::fdo::Result<PlaybackRate> { Ok(1.0) }
-    async fn set_rate(&self, _: PlaybackRate) -> ZResult<()> { Ok(()) }
-    async fn shuffle(&self) -> mpris_server::zbus::fdo::Result<bool> { Ok(false) }
-    async fn set_shuffle(&self, _: bool) -> ZResult<()> { Ok(()) }
+    async fn loop_status(&self) -> mpris_server::zbus::fdo::Result<LoopStatus> {
+        Ok(LoopStatus::None)
+    }
+    async fn set_loop_status(&self, _: LoopStatus) -> ZResult<()> {
+        Ok(())
+    }
+    async fn rate(&self) -> mpris_server::zbus::fdo::Result<PlaybackRate> {
+        Ok(1.0)
+    }
+    async fn set_rate(&self, _: PlaybackRate) -> ZResult<()> {
+        Ok(())
+    }
+    async fn shuffle(&self) -> mpris_server::zbus::fdo::Result<bool> {
+        Ok(false)
+    }
+    async fn set_shuffle(&self, _: bool) -> ZResult<()> {
+        Ok(())
+    }
 
     async fn metadata(&self) -> mpris_server::zbus::fdo::Result<Metadata> {
         Ok(self.state.read().await.metadata.clone())
@@ -128,14 +174,30 @@ impl PlayerInterface for MprisHandler {
         }
         Ok(state.position)
     }
-    async fn minimum_rate(&self) -> mpris_server::zbus::fdo::Result<PlaybackRate> { Ok(0.0) }
-    async fn maximum_rate(&self) -> mpris_server::zbus::fdo::Result<PlaybackRate> { Ok(2.0) }
-    async fn can_go_next(&self) -> mpris_server::zbus::fdo::Result<bool> { Ok(true) }
-    async fn can_go_previous(&self) -> mpris_server::zbus::fdo::Result<bool> { Ok(true) }
-    async fn can_play(&self) -> mpris_server::zbus::fdo::Result<bool> { Ok(true) }
-    async fn can_pause(&self) -> mpris_server::zbus::fdo::Result<bool> { Ok(true) }
-    async fn can_seek(&self) -> mpris_server::zbus::fdo::Result<bool> { Ok(true) }
-    async fn can_control(&self) -> mpris_server::zbus::fdo::Result<bool> { Ok(true) }
+    async fn minimum_rate(&self) -> mpris_server::zbus::fdo::Result<PlaybackRate> {
+        Ok(0.0)
+    }
+    async fn maximum_rate(&self) -> mpris_server::zbus::fdo::Result<PlaybackRate> {
+        Ok(2.0)
+    }
+    async fn can_go_next(&self) -> mpris_server::zbus::fdo::Result<bool> {
+        Ok(true)
+    }
+    async fn can_go_previous(&self) -> mpris_server::zbus::fdo::Result<bool> {
+        Ok(true)
+    }
+    async fn can_play(&self) -> mpris_server::zbus::fdo::Result<bool> {
+        Ok(true)
+    }
+    async fn can_pause(&self) -> mpris_server::zbus::fdo::Result<bool> {
+        Ok(true)
+    }
+    async fn can_seek(&self) -> mpris_server::zbus::fdo::Result<bool> {
+        Ok(true)
+    }
+    async fn can_control(&self) -> mpris_server::zbus::fdo::Result<bool> {
+        Ok(true)
+    }
 }
 
 impl MprisServer {
@@ -146,10 +208,16 @@ impl MprisServer {
             cmd_tx,
         };
         match Server::new("music_player_tui", handler).await {
-            Ok(server) => Ok(Self { server: Some(server), state }),
+            Ok(server) => Ok(Self {
+                server: Some(server),
+                state,
+            }),
             Err(e) => {
                 dlog!("MPRIS init failed: {}", e);
-                Ok(Self { server: None, state })
+                Ok(Self {
+                    server: None,
+                    state,
+                })
             }
         }
     }
@@ -176,15 +244,19 @@ impl MprisServer {
                 state.started_at = Some(Instant::now());
             }
 
-            let _ = server.properties_changed([
-                Property::Metadata(metadata),
-            ]).await;
+            let _ = server
+                .properties_changed([Property::Metadata(metadata)])
+                .await;
         }
     }
 
     pub async fn set_playing(&self, playing: bool) {
         if let Some(ref server) = self.server {
-            let status = if playing { PlaybackStatus::Playing } else { PlaybackStatus::Paused };
+            let status = if playing {
+                PlaybackStatus::Playing
+            } else {
+                PlaybackStatus::Paused
+            };
             {
                 let mut state = self.state.write().await;
                 state.playback_status = status;
@@ -195,9 +267,9 @@ impl MprisServer {
                     state.started_at = None;
                 }
             }
-            let _ = server.properties_changed([
-                Property::PlaybackStatus(status),
-            ]).await;
+            let _ = server
+                .properties_changed([Property::PlaybackStatus(status)])
+                .await;
         }
     }
 
@@ -207,9 +279,9 @@ impl MprisServer {
                 let mut state = self.state.write().await;
                 state.volume = volume as f64;
             }
-            let _ = server.properties_changed([
-                Property::Volume(volume as f64),
-            ]).await;
+            let _ = server
+                .properties_changed([Property::Volume(volume as f64)])
+                .await;
         }
     }
 }

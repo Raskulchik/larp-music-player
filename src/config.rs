@@ -12,9 +12,19 @@ pub struct Config {
     pub lastfm_api_key: String,
     #[serde(default)]
     pub liked_shuffle: bool,
+    #[serde(default)]
+    pub last_update_check: u64,
 }
 
 pub const DEFAULT_DISCORD_CLIENT_ID: &str = "1409612809859366932";
+
+/// Epoch seconds (0 if unavailable).
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 fn config_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());

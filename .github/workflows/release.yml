@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked
+      - name: Test
+        run: cargo test --release --locked
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Package (binary + ytmeta.py)
+        run: |
+          mkdir -p dist
+          cp target/release/larp-music-player dist/
+          cp ytmeta.py dist/
+          tar -czf larp-music-player-linux-x86_64.tar.gz -C dist .
+          sha256sum larp-music-player-linux-x86_64.tar.gz > larp-music-player-linux-x86_64.tar.gz.sha256
+          cat larp-music-player-linux-x86_64.tar.gz.sha256
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            larp-music-player-linux-x86_64.tar.gz
+            larp-music-player-linux-x86_64.tar.gz.sha256
+          generate_release_notes: true
+          body: |
+            ## larp-music-player
+
+            TUI music player. Extract the archive and run the binary; keep `ytmeta.py` next to it (metadata helper).
+
+            ```
+            tar -xzf larp-music-player-linux-x86_64.tar.gz
+            ./larp-music-player
+            ```

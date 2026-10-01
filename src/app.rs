@@ -1,24 +1,52 @@
-use tokio::sync::mpsc;
 use crate::api::{self, Source, Track};
 use crate::db::{Database, Playlist};
+use tokio::sync::mpsc;
 
 pub enum Command {
     SearchResults(Vec<Track>),
     SearchError(String),
-    PlayStarted { actual_duration_ms: Option<u64> },
+    PlayStarted {
+        actual_duration_ms: Option<u64>,
+    },
     PlaybackFinished,
     PlayError(String),
     DownloadProgress(u32),
-    DownloadLikedProgress { current: usize, total: usize },
-    DownloadLikedDone { downloaded: usize, failed: usize },
+    DownloadLikedProgress {
+        current: usize,
+        total: usize,
+    },
+    DownloadLikedDone {
+        downloaded: usize,
+        failed: usize,
+    },
     DownloadLikedTrack(Track),
-    DownloadLikedTrackDone { title: String, ok: bool },
+    DownloadLikedTrackDone {
+        title: String,
+        ok: bool,
+    },
     Status(String),
     FetchLyrics,
-    LyricsLoaded { track_id: String, lines: Vec<(u64, String)>, source: String },
+    LyricsLoaded {
+        track_id: String,
+        lines: Vec<(u64, String)>,
+        source: String,
+    },
     LyricsError(String),
-    TrackMetadata { track_id: String, album: Option<String>, year: Option<u16> },
-    YtMetaUpdated { track_id: String, duration_ms: Option<u64>, artwork_url: Option<String> },
+    TrackMetadata {
+        track_id: String,
+        album: Option<String>,
+        year: Option<u16>,
+    },
+    MetaUpdated {
+        source: Source,
+        track_id: String,
+        duration_ms: Option<u64>,
+        artwork_url: Option<String>,
+    },
+    UpdateAvailable {
+        tag: String,
+        url: String,
+    },
     RadioFound(Vec<Track>),
     BluetoothStatus(Option<String>),
 }
@@ -105,6 +133,7 @@ pub struct App {
     pub playlists: Vec<Playlist>,
     pub active_playlist_id: Option<i64>,
     pub name_input: String,
+    pub update_available: Option<String>,
     cmd_tx: mpsc::UnboundedSender<Command>,
 }
 
@@ -125,7 +154,11 @@ impl App {
             current_index: 0,
             is_playing: false,
             volume: 0.7,
-            current_source: if has_token { Source::YandexMusic } else { Source::ITunes },
+            current_source: if has_token {
+                Source::YandexMusic
+            } else {
+                Source::ITunes
+            },
             search_query: String::new(),
             token,
             sc_client_id,
@@ -143,7 +176,7 @@ impl App {
             paused_at_ms: None,
             track_duration_ms: None,
             playing_track_id: None,
-        playing_track: None,
+            playing_track: None,
             download_liked_progress: None,
             db,
             shuffle: false,
@@ -161,6 +194,7 @@ impl App {
             playlists: Vec::new(),
             active_playlist_id: None,
             name_input: String::new(),
+            update_available: None,
             cmd_tx,
         }
     }
@@ -170,7 +204,8 @@ impl App {
     }
 
     pub fn current_track_id(&self) -> Option<String> {
-        self.current_track().map(|t| format!("{}:{}", t.source as u8, t.id))
+        self.current_track()
+            .map(|t| format!("{}:{}", t.source as u8, t.id))
     }
 
     pub fn note_playing(&mut self) {
@@ -218,7 +253,8 @@ impl App {
         self.status_message = "Playing".to_string();
         if let Some(paused) = self.paused_at_ms {
             let real = (paused as f64 / self.playback_speed.max(0.01) as f64) as u64;
-            self.started_at = Some(std::time::Instant::now() - std::time::Duration::from_millis(real));
+            self.started_at =
+                Some(std::time::Instant::now() - std::time::Duration::from_millis(real));
             self.paused_at_ms = None;
         }
     }
@@ -239,7 +275,8 @@ impl App {
         if self.paused_at_ms.is_some() {
             self.paused_at_ms = Some(ms);
         } else if self.started_at.is_some() {
-            self.started_at = Some(std::time::Instant::now() - std::time::Duration::from_millis(real_ms));
+            self.started_at =
+                Some(std::time::Instant::now() - std::time::Duration::from_millis(real_ms));
         }
     }
 
@@ -341,7 +378,11 @@ impl App {
             self.tracks = tracks;
         }
         if let Some((src, id)) = anchor {
-            if let Some(idx) = self.tracks.iter().position(|t| t.source == src && t.id == id) {
+            if let Some(idx) = self
+                .tracks
+                .iter()
+                .position(|t| t.source == src && t.id == id)
+            {
                 self.current_index = idx;
             } else {
                 self.current_index = 0;
@@ -377,7 +418,11 @@ impl App {
     }
 
     pub fn speed_down(&mut self) {
-        if let Some(s) = SPEEDS.iter().rev().find(|s| **s < self.playback_speed - 0.01) {
+        if let Some(s) = SPEEDS
+            .iter()
+            .rev()
+            .find(|s| **s < self.playback_speed - 0.01)
+        {
             self.playback_speed = *s;
         }
     }
@@ -476,7 +521,8 @@ impl App {
             }
             InputMode::PlaylistSelect => {
                 if self.playlists.len() > 0 {
-                    self.select_index = (self.select_index + self.playlists.len() - 1) % self.playlists.len();
+                    self.select_index =
+                        (self.select_index + self.playlists.len() - 1) % self.playlists.len();
                 }
             }
             _ => {}
@@ -621,8 +667,14 @@ impl App {
                 self.playing_track_id = None;
                 self.playing_track = None;
                 self.radio_active = false;
-                if let Some(name) = self.playlists.iter().find(|p| p.id == id).map(|p| p.name.clone()) {
-                    self.status_message = format!("{}: {} tracks — Shift+D remove from playlist", name, count);
+                if let Some(name) = self
+                    .playlists
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.name.clone())
+                {
+                    self.status_message =
+                        format!("{}: {} tracks — Shift+D remove from playlist", name, count);
                 }
             }
             Err(e) => {
@@ -636,7 +688,8 @@ impl App {
     }
 
     pub fn playlist_name(&self) -> Option<String> {
-        self.playlists.iter()
+        self.playlists
+            .iter()
             .find(|p| Some(p.id) == self.active_playlist_id)
             .map(|p| p.name.clone())
     }
@@ -656,7 +709,8 @@ impl App {
         match self.db.create_playlist(&name) {
             Ok(_) => {
                 self.enter_playlists();
-                self.status_message = format!("Playlist \"{}\" created — Shift+A to add tracks", name);
+                self.status_message =
+                    format!("Playlist \"{}\" created — Shift+A to add tracks", name);
             }
             Err(e) => {
                 self.status_message = format!("Create failed (maybe duplicate): {}", e);
@@ -669,7 +723,9 @@ impl App {
             self.status_message = "No playlists to delete".to_string();
             return;
         }
-        let idx = self.current_index.min(self.playlists.len().saturating_sub(1));
+        let idx = self
+            .current_index
+            .min(self.playlists.len().saturating_sub(1));
         let pl = self.playlists[idx].clone();
         if let Err(e) = self.db.delete_playlist(pl.id) {
             self.status_message = format!("Delete failed: {}", e);
@@ -686,9 +742,16 @@ impl App {
         if !self.playlists_view_open() {
             return;
         }
-        let Some(pl_id) = self.active_playlist_id else { return };
-        let Some(track) = self.current_track().cloned() else { return };
-        if let Err(e) = self.db.remove_from_playlist(pl_id, &track.source, &track.id) {
+        let Some(pl_id) = self.active_playlist_id else {
+            return;
+        };
+        let Some(track) = self.current_track().cloned() else {
+            return;
+        };
+        if let Err(e) = self
+            .db
+            .remove_from_playlist(pl_id, &track.source, &track.id)
+        {
             self.status_message = format!("Remove failed: {}", e);
             return;
         }
@@ -723,11 +786,14 @@ impl App {
             self.status_message = "Select a playlist first".to_string();
             return;
         };
-        let Some(track) = self.current_track().cloned() else { return };
+        let Some(track) = self.current_track().cloned() else {
+            return;
+        };
         match self.db.add_to_playlist(pl.id, &track) {
             Ok(_) => {
                 self.load_playlists();
-                self.status_message = format!("Added \"{}\" to playlist \"{}\"", track.title, pl.name);
+                self.status_message =
+                    format!("Added \"{}\" to playlist \"{}\"", track.title, pl.name);
             }
             Err(e) => {
                 self.status_message = format!("Add failed: {}", e);
@@ -747,10 +813,18 @@ impl App {
 
     pub fn input_backspace(&mut self) {
         match self.input_mode {
-            InputMode::Search => { self.search_query.pop(); }
-            InputMode::TokenInput => { self.token.pop(); }
-            InputMode::ClientIdInput => { self.sc_client_id.pop(); }
-            InputMode::NameInput => { self.name_input.pop(); }
+            InputMode::Search => {
+                self.search_query.pop();
+            }
+            InputMode::TokenInput => {
+                self.token.pop();
+            }
+            InputMode::ClientIdInput => {
+                self.sc_client_id.pop();
+            }
+            InputMode::NameInput => {
+                self.name_input.pop();
+            }
             _ => {}
         }
     }
@@ -874,21 +948,11 @@ impl App {
     }
 
     pub fn get_play_url(&self) -> Option<(String, Source)> {
-        self.current_track().map(|t| {
-            match t.source {
-                Source::ITunes => {
-                    (t.preview_url.clone().unwrap_or_default(), t.source)
-                }
-                Source::SoundCloud => {
-                    (t.preview_url.clone().unwrap_or_default(), t.source)
-                }
-                Source::YandexMusic => {
-                    (t.id.clone(), t.source)
-                }
-                Source::YouTubeMusic => {
-                    (t.id.clone(), t.source)
-                }
-            }
+        self.current_track().map(|t| match t.source {
+            Source::ITunes => (t.preview_url.clone().unwrap_or_default(), t.source),
+            Source::SoundCloud => (t.preview_url.clone().unwrap_or_default(), t.source),
+            Source::YandexMusic => (t.id.clone(), t.source),
+            Source::YouTubeMusic => (t.id.clone(), t.source),
         })
     }
 
@@ -913,7 +977,8 @@ impl App {
                 self.status_message = format!("Error: {}", e);
                 if self.current_source == Source::SoundCloud && self.sc_client_id.is_empty() {
                     self.input_mode = InputMode::ClientIdInput;
-                    self.status_message = "Auto-extract failed. Enter SoundCloud client_id:".to_string();
+                    self.status_message =
+                        "Auto-extract failed. Enter SoundCloud client_id:".to_string();
                 }
             }
             Command::PlayStarted { actual_duration_ms } => {
@@ -926,7 +991,8 @@ impl App {
                 if let Some(dur) = actual_duration_ms {
                     self.track_duration_ms = Some(dur);
                     if let Some(idx) = self.tracks.iter().position(|t| {
-                        format!("{}:{}", t.source as u8, t.id) == self.playing_track_id.as_deref().unwrap_or("")
+                        format!("{}:{}", t.source as u8, t.id)
+                            == self.playing_track_id.as_deref().unwrap_or("")
                     }) {
                         self.tracks[idx].duration_ms = Some(dur);
                     }
@@ -960,7 +1026,8 @@ impl App {
             }
             Command::DownloadLikedDone { downloaded, failed } => {
                 self.download_liked_progress = None;
-                self.status_message = format!("Download complete: {} ok, {} failed", downloaded, failed);
+                self.status_message =
+                    format!("Download complete: {} ok, {} failed", downloaded, failed);
             }
             Command::DownloadLikedTrack(_) => {}
             Command::DownloadLikedTrackDone { title, ok } => {
@@ -974,8 +1041,16 @@ impl App {
                 self.status_message = msg;
             }
             Command::FetchLyrics => {}
-            Command::LyricsLoaded { track_id, lines, source } => {
-                if self.current_track_id().map(|id| id == track_id).unwrap_or(false) {
+            Command::LyricsLoaded {
+                track_id,
+                lines,
+                source,
+            } => {
+                if self
+                    .current_track_id()
+                    .map(|id| id == track_id)
+                    .unwrap_or(false)
+                {
                     self.lyrics_lines = lines;
                     self.lyrics_loading = false;
                     self.lyrics_error = None;
@@ -990,10 +1065,16 @@ impl App {
                     self.lyrics_error = Some(format!("lyrics error: {}", e));
                 }
             }
-            Command::TrackMetadata { track_id, album, year } => {
-                if let Some(idx) = self.tracks.iter().position(|t| {
-                    format!("{}:{}", t.source as u8, t.id) == track_id
-                }) {
+            Command::TrackMetadata {
+                track_id,
+                album,
+                year,
+            } => {
+                if let Some(idx) = self
+                    .tracks
+                    .iter()
+                    .position(|t| format!("{}:{}", t.source as u8, t.id) == track_id)
+                {
                     let t = &mut self.tracks[idx];
                     if album.is_some() {
                         t.album = album;
@@ -1022,16 +1103,23 @@ impl App {
                     "Radio: no similar tracks found".to_string()
                 };
             }
-            Command::YtMetaUpdated { track_id, duration_ms, artwork_url } => {
+            Command::MetaUpdated {
+                source,
+                track_id,
+                duration_ms,
+                artwork_url,
+            } => {
                 let _ = self.db.update_liked_meta(
-                    &Source::YouTubeMusic,
+                    &source,
                     &track_id,
                     duration_ms,
                     artwork_url.as_deref(),
                 );
-                if let Some(idx) = self.tracks.iter().position(|t| {
-                    t.source == Source::YouTubeMusic && t.id == track_id
-                }) {
+                if let Some(idx) = self
+                    .tracks
+                    .iter()
+                    .position(|t| t.source == source && t.id == track_id)
+                {
                     if let Some(d) = duration_ms {
                         self.tracks[idx].duration_ms = Some(d);
                     }
@@ -1043,7 +1131,16 @@ impl App {
             Command::BluetoothStatus(device) => {
                 self.bluetooth_device = device;
             }
+            Command::UpdateAvailable { tag, url } => {
+                self.update_available = Some(url.clone());
+                self.status_message =
+                    format!("Update {} available — press U to open release page", tag);
+            }
         }
+    }
+
+    pub fn take_update_url(&mut self) -> Option<String> {
+        self.update_available.take()
     }
 }
 

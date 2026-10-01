@@ -1,11 +1,11 @@
+use crate::app::Command as AppCommand;
 use crate::dlog;
+use rodio::{buffer::SamplesBuffer, OutputStream, Sink, Source};
 use std::path::PathBuf;
 use std::process::{Command as FfmpegCommand, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use rodio::{OutputStream, Sink, Source, buffer::SamplesBuffer};
 use tokio::sync::mpsc;
-use crate::app::Command as AppCommand;
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -37,7 +37,12 @@ fn is_stale(gen: u64) -> bool {
     gen != GENERATION.load(Ordering::SeqCst)
 }
 
-pub fn start(cmd_tx: mpsc::UnboundedSender<AppCommand>) -> (mpsc::UnboundedSender<PlayerCommand>, tokio::task::JoinHandle<()>) {
+pub fn start(
+    cmd_tx: mpsc::UnboundedSender<AppCommand>,
+) -> (
+    mpsc::UnboundedSender<PlayerCommand>,
+    tokio::task::JoinHandle<()>,
+) {
     let (tx, mut rx) = mpsc::unbounded_channel::<PlayerCommand>();
 
     let handle = tokio::task::spawn_blocking(move || {
@@ -66,11 +71,20 @@ pub fn start(cmd_tx: mpsc::UnboundedSender<AppCommand>) -> (mpsc::UnboundedSende
                         let pcm_key = &url_or_path;
                         let cached = cache_path(pcm_key);
 
-                        let pcm_data = if cached.exists() && std::fs::metadata(&cached).map(|m| m.len() > 0).unwrap_or(false) {
+                        let pcm_data = if cached.exists()
+                            && std::fs::metadata(&cached)
+                                .map(|m| m.len() > 0)
+                                .unwrap_or(false)
+                        {
                             std::fs::read(&cached).ok()
                         } else if url_or_path.contains(".m3u8") {
-                            if is_stale(generation) { continue; }
-                            dlog!("[player] HLS stream: {}", &url_or_path[..url_or_path.len().min(120)]);
+                            if is_stale(generation) {
+                                continue;
+                            }
+                            dlog!(
+                                "[player] HLS stream: {}",
+                                &url_or_path[..url_or_path.len().min(120)]
+                            );
                             match decode_with_ffmpeg_url(&url_or_path) {
                                 Ok(samples) if !samples.is_empty() => {
                                     dlog!("[player] decoded {} samples from HLS", samples.len());
@@ -79,14 +93,21 @@ pub fn start(cmd_tx: mpsc::UnboundedSender<AppCommand>) -> (mpsc::UnboundedSende
                                     Some(pcm)
                                 }
                                 _ => {
-                                    let _ = cmd_tx.send(AppCommand::PlayError("HLS decode failed".to_string()));
+                                    let _ = cmd_tx.send(AppCommand::PlayError(
+                                        "HLS decode failed".to_string(),
+                                    ));
                                     continue;
                                 }
                             }
                         } else {
                             let raw = if url_or_path.starts_with("http") {
-                                if is_stale(generation) { continue; }
-                                dlog!("[player] downloading: {}", &url_or_path[..url_or_path.len().min(120)]);
+                                if is_stale(generation) {
+                                    continue;
+                                }
+                                dlog!(
+                                    "[player] downloading: {}",
+                                    &url_or_path[..url_or_path.len().min(120)]
+                                );
                                 let _ = cmd_tx.send(AppCommand::DownloadProgress(0));
                                 match download_with_progress(&url_or_path, generation, &cmd_tx) {
                                     Ok(bytes) => {
@@ -94,7 +115,10 @@ pub fn start(cmd_tx: mpsc::UnboundedSender<AppCommand>) -> (mpsc::UnboundedSende
                                         Some(bytes)
                                     }
                                     Err(e) => {
-                                        let _ = cmd_tx.send(AppCommand::PlayError(format!("curl error: {}", e)));
+                                        let _ = cmd_tx.send(AppCommand::PlayError(format!(
+                                            "curl error: {}",
+                                            e
+                                        )));
                                         continue;
                                     }
                                 }
@@ -102,25 +126,34 @@ pub fn start(cmd_tx: mpsc::UnboundedSender<AppCommand>) -> (mpsc::UnboundedSende
                                 std::fs::read(&url_or_path).ok()
                             };
 
-                            if is_stale(generation) { continue; }
+                            if is_stale(generation) {
+                                continue;
+                            }
 
                             let _ = cmd_tx.send(AppCommand::DownloadProgress(101));
                             match raw.and_then(|bytes| decode_with_ffmpeg(&bytes).ok()) {
                                 Some(samples) if !samples.is_empty() => {
-                                    dlog!("[player] decoded {} samples ({}ms)", samples.len(), samples.len() / 88);
+                                    dlog!(
+                                        "[player] decoded {} samples ({}ms)",
+                                        samples.len(),
+                                        samples.len() / 88
+                                    );
                                     let pcm = samples_to_bytes(&samples);
                                     let _ = std::fs::write(&cached, &pcm);
                                     Some(pcm)
                                 }
                                 _ => {
                                     dlog!("[player] decode returned empty/failed");
-                                    let _ = cmd_tx.send(AppCommand::PlayError("Decode failed".to_string()));
+                                    let _ = cmd_tx
+                                        .send(AppCommand::PlayError("Decode failed".to_string()));
                                     continue;
                                 }
                             }
                         };
 
-                        if is_stale(generation) { continue; }
+                        if is_stale(generation) {
+                            continue;
+                        }
 
                         match pcm_data {
                             Some(pcm) => {
@@ -128,16 +161,17 @@ pub fn start(cmd_tx: mpsc::UnboundedSender<AppCommand>) -> (mpsc::UnboundedSende
                                 let samples = bytes_to_samples(&pcm);
                                 current_samples = Some(samples.clone());
                                 current_amplify = volume;
-                                let source = SamplesBuffer::new(2, 44100, samples)
-                                    .amplify(volume);
+                                let source = SamplesBuffer::new(2, 44100, samples).amplify(volume);
                                 sink.append(source);
                                 sink.play();
                                 playing = true;
-                                let actual_duration_ms = Some((pcm.len() as u64 * 1000) / (4 * 44100));
+                                let actual_duration_ms =
+                                    Some((pcm.len() as u64 * 1000) / (4 * 44100));
                                 let _ = cmd_tx.send(AppCommand::PlayStarted { actual_duration_ms });
                             }
                             None => {
-                                let _ = cmd_tx.send(AppCommand::PlayError("No audio data".to_string()));
+                                let _ =
+                                    cmd_tx.send(AppCommand::PlayError("No audio data".to_string()));
                             }
                         }
                     }
@@ -167,8 +201,9 @@ pub fn start(cmd_tx: mpsc::UnboundedSender<AppCommand>) -> (mpsc::UnboundedSende
                                 let was_playing = playing;
                                 sink.stop();
                                 let vol = sink.volume();
-                                let source = SamplesBuffer::new(2, 44100, samples[start..].to_vec())
-                                    .amplify(current_amplify);
+                                let source =
+                                    SamplesBuffer::new(2, 44100, samples[start..].to_vec())
+                                        .amplify(current_amplify);
                                 sink.set_volume(vol);
                                 sink.append(source);
                                 if was_playing {
@@ -197,7 +232,11 @@ pub fn start(cmd_tx: mpsc::UnboundedSender<AppCommand>) -> (mpsc::UnboundedSende
     (tx, handle)
 }
 
-fn download_with_progress(url: &str, generation: u64, cmd_tx: &mpsc::UnboundedSender<AppCommand>) -> Result<Vec<u8>, String> {
+fn download_with_progress(
+    url: &str,
+    generation: u64,
+    cmd_tx: &mpsc::UnboundedSender<AppCommand>,
+) -> Result<Vec<u8>, String> {
     use std::io::Read;
 
     let mut child = std::process::Command::new("curl")
@@ -225,7 +264,11 @@ fn download_with_progress(url: &str, generation: u64, cmd_tx: &mpsc::UnboundedSe
                 Ok(n) => {
                     data.extend_from_slice(&buf[..n]);
                     bytes_read += n as u64;
-                    let pct = if bytes_read > 0 { ((bytes_read as f64 / 1_000_000.0 * 100.0).min(99.0)) as u32 } else { 0 };
+                    let pct = if bytes_read > 0 {
+                        ((bytes_read as f64 / 1_000_000.0 * 100.0).min(99.0)) as u32
+                    } else {
+                        0
+                    };
                     let _ = cmd_tx.send(AppCommand::DownloadProgress(pct));
                 }
                 Err(_) => break,
@@ -260,11 +303,7 @@ fn decode_with_ffmpeg(input: &[u8]) -> anyhow::Result<Vec<i16>> {
 
     let mut child = FfmpegCommand::new("ffmpeg")
         .args([
-            "-i", "pipe:0",
-            "-f", "s16le",
-            "-ar", "44100",
-            "-ac", "2",
-            "pipe:1",
+            "-i", "pipe:0", "-f", "s16le", "-ar", "44100", "-ac", "2", "pipe:1",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -290,7 +329,9 @@ fn decode_with_ffmpeg(input: &[u8]) -> anyhow::Result<Vec<i16>> {
 
 fn decode_with_ffmpeg_url(url: &str) -> anyhow::Result<Vec<i16>> {
     let output = std::process::Command::new("ffmpeg")
-        .args(["-i", url, "-f", "s16le", "-ar", "44100", "-ac", "2", "pipe:1"])
+        .args([
+            "-i", url, "-f", "s16le", "-ar", "44100", "-ac", "2", "pipe:1",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()?;

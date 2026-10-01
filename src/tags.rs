@@ -5,7 +5,13 @@ use lofty::prelude::*;
 use lofty::tag::{Accessor, Tag, TagType};
 use std::path::Path;
 
-pub fn tag_file(path: &Path, artist: &str, title: &str, album: Option<&str>, year: Option<u16>) -> anyhow::Result<()> {
+pub fn tag_file(
+    path: &Path,
+    artist: &str,
+    title: &str,
+    album: Option<&str>,
+    year: Option<u16>,
+) -> anyhow::Result<()> {
     if !path.exists() {
         anyhow::bail!("file not found: {}", path.display());
     }
@@ -39,7 +45,12 @@ pub fn tag_file(path: &Path, artist: &str, title: &str, album: Option<&str>, yea
     Ok(())
 }
 
-pub fn tag_track_file(path: &Path, track: &crate::api::Track, album: Option<&str>, year: Option<u16>) {
+pub fn tag_track_file(
+    path: &Path,
+    track: &crate::api::Track,
+    album: Option<&str>,
+    year: Option<u16>,
+) {
     match tag_file(path, &track.artist, &track.title, album, year) {
         Ok(()) => dlog!("[tags] tagged {}", path.display()),
         Err(e) => dlog!("[tags] tagging failed for {}: {}", path.display(), e),
@@ -57,11 +68,29 @@ mod tests {
         let path = std::path::Path::new("/tmp/opencode/test.mp3");
         if !path.exists() {
             let _ = std::process::Command::new("ffmpeg")
-                .args(["-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-codec:a", "libmp3lame", "-q:a", "9", "/tmp/opencode/test.mp3"])
+                .args([
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:duration=1",
+                    "-codec:a",
+                    "libmp3lame",
+                    "-q:a",
+                    "9",
+                    "/tmp/opencode/test.mp3",
+                ])
                 .output()
                 .expect("ffmpeg must be available to run this test");
         }
-        tag_file(path, "Test Artist", "Test Title", Some("Test Album"), Some(2001)).unwrap();
+        tag_file(
+            path,
+            "Test Artist",
+            "Test Title",
+            Some("Test Album"),
+            Some(2001),
+        )
+        .unwrap();
 
         let tf = lofty::read_from_path(path).unwrap();
         let tag = tf.primary_tag().unwrap();

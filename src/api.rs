@@ -56,8 +56,13 @@ pub async fn search_itunes(query: &str) -> anyhow::Result<Vec<Track>> {
     }
 
     let text = resp.text().await?;
-    let resp: ItunesResponse = serde_json::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("iTunes parse error: {} | body: {}", e, &text[..text.len().min(500)]))?;
+    let resp: ItunesResponse = serde_json::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "iTunes parse error: {} | body: {}",
+            e,
+            &text[..text.len().min(500)]
+        )
+    })?;
 
     let tracks = resp
         .results
@@ -165,8 +170,13 @@ pub async fn search_yandex(query: &str, token: &str) -> anyhow::Result<Vec<Track
     }
 
     let text = resp.text().await?;
-    let resp: YmSearchResponse = serde_json::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("Yandex parse error: {} | body: {}", e, &text[..text.len().min(500)]))?;
+    let resp: YmSearchResponse = serde_json::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "Yandex parse error: {} | body: {}",
+            e,
+            &text[..text.len().min(500)]
+        )
+    })?;
 
     let tracks = resp
         .result
@@ -181,13 +191,15 @@ pub async fn search_yandex(query: &str, token: &str) -> anyhow::Result<Vec<Track
                 serde_json::Value::String(s) => s.clone(),
                 _ => "0".to_string(),
             };
-            let artist = t.artists.first()
+            let artist = t
+                .artists
+                .first()
                 .and_then(|a| a.name.clone())
                 .unwrap_or_else(|| "Unknown".to_string());
             let duration = t.duration_ms;
-            let artwork_url = t.cover_uri.map(|uri| {
-                format!("https://{}", uri.replace("%%", "1000x1000"))
-            });
+            let artwork_url = t
+                .cover_uri
+                .map(|uri| format!("https://{}", uri.replace("%%", "1000x1000")));
             Track {
                 id,
                 title: t.title.unwrap_or_default(),
@@ -222,10 +234,17 @@ pub async fn get_yandex_download_url(track_id: &str, token: &str) -> anyhow::Res
     }
 
     let text = resp.text().await?;
-    let resp: YmDownloadInfoResponse = serde_json::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("Yandex download parse error: {} | body: {}", e, &text[..text.len().min(500)]))?;
+    let resp: YmDownloadInfoResponse = serde_json::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "Yandex download parse error: {} | body: {}",
+            e,
+            &text[..text.len().min(500)]
+        )
+    })?;
 
-    let info = resp.result.iter()
+    let info = resp
+        .result
+        .iter()
         .find(|i| i.codec == "mp3" || i.codec == "flac")
         .or(resp.result.first())
         .ok_or_else(|| anyhow::anyhow!("No download info found"))?;
@@ -235,7 +254,10 @@ pub async fn get_yandex_download_url(track_id: &str, token: &str) -> anyhow::Res
 
     let download_url: YmDownloadUrl = serde_xml_rs::from_str(&xml_text)?;
 
-    let path_no_slash = download_url.path.strip_prefix('/').unwrap_or(&download_url.path);
+    let path_no_slash = download_url
+        .path
+        .strip_prefix('/')
+        .unwrap_or(&download_url.path);
     let sign_input = format!("{}{}{}", YM_SIGN_SALT, path_no_slash, download_url.s);
     let sign = format!("{:x}", md5::compute(sign_input.as_bytes()));
 
@@ -282,12 +304,14 @@ async fn get_sc_client_id() -> anyhow::Result<String> {
 
     let html = tokio::task::spawn_blocking(|| -> anyhow::Result<String> {
         curl_get("https://soundcloud.com/")
-    }).await??;
+    })
+    .await??;
 
     let script_re = regex::Regex::new(r#"src="(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)""#)?;
     let cid_re = regex::Regex::new(r#"client_id:"([a-zA-Z0-9]+)""#)?;
 
-    let mut script_urls: Vec<String> = script_re.captures_iter(&html)
+    let mut script_urls: Vec<String> = script_re
+        .captures_iter(&html)
         .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
         .collect();
     script_urls.reverse();
@@ -296,7 +320,9 @@ async fn get_sc_client_id() -> anyhow::Result<String> {
         let js_text = match tokio::task::spawn_blocking({
             let url = js_url.clone();
             move || curl_get(&url)
-        }).await {
+        })
+        .await
+        {
             Ok(Ok(text)) => text,
             _ => continue,
         };
@@ -363,7 +389,8 @@ pub async fn search_soundcloud(query: &str) -> anyhow::Result<Vec<Track>> {
     let body = tokio::task::spawn_blocking({
         let url = url.clone();
         move || curl_get(&url)
-    }).await??;
+    })
+    .await??;
 
     if body.trim() == "{}" || body.trim().is_empty() {
         SC_CLIENT_ID.lock().unwrap().take();
@@ -372,36 +399,47 @@ pub async fn search_soundcloud(query: &str) -> anyhow::Result<Vec<Track>> {
 
     let resp: ScSearchResponse = serde_json::from_str(&body)?;
 
-    let tracks = resp.collection.into_iter().map(|t| {
-        let artwork = t.artwork_url.map(|u| u.replace("-large", "-t500x500"));
+    let tracks = resp
+        .collection
+        .into_iter()
+        .map(|t| {
+            let artwork = t.artwork_url.map(|u| u.replace("-large", "-t500x500"));
 
-        let mut preview_url = None;
-        if let Some(ref media) = t.media {
-            // cbc-encrypted-hls works — ffmpeg handles HLS natively
-            // prefer audio/mp4 (returns m3u8 URL), not audio/mpegurl (returns {})
-            if let Some(tc) = media.transcodings.iter().find(|tc| tc.format.protocol == "cbc-encrypted-hls" && tc.format.mime_type.starts_with("audio/mp4")) {
-                preview_url = Some(tc.url.clone());
-            }
-            if preview_url.is_none() {
-                if let Some(tc) = media.transcodings.iter().find(|tc| tc.format.protocol == "hls") {
+            let mut preview_url = None;
+            if let Some(ref media) = t.media {
+                // cbc-encrypted-hls works — ffmpeg handles HLS natively
+                // prefer audio/mp4 (returns m3u8 URL), not audio/mpegurl (returns {})
+                if let Some(tc) = media.transcodings.iter().find(|tc| {
+                    tc.format.protocol == "cbc-encrypted-hls"
+                        && tc.format.mime_type.starts_with("audio/mp4")
+                }) {
                     preview_url = Some(tc.url.clone());
                 }
+                if preview_url.is_none() {
+                    if let Some(tc) = media
+                        .transcodings
+                        .iter()
+                        .find(|tc| tc.format.protocol == "hls")
+                    {
+                        preview_url = Some(tc.url.clone());
+                    }
+                }
+                // progressive is blocked by SoundCloud — skip it
             }
-            // progressive is blocked by SoundCloud — skip it
-        }
 
-        Track {
-            id: t.id.to_string(),
-            title: t.title,
-            artist: t.user.username,
-            source: Source::SoundCloud,
-            preview_url,
-            artwork_url: artwork,
-            duration_ms: Some(t.duration),
-            album: None,
-            year: None,
-        }
-    }).collect();
+            Track {
+                id: t.id.to_string(),
+                title: t.title,
+                artist: t.user.username,
+                source: Source::SoundCloud,
+                preview_url,
+                artwork_url: artwork,
+                duration_ms: Some(t.duration),
+                album: None,
+                year: None,
+            }
+        })
+        .collect();
 
     Ok(tracks)
 }
@@ -424,7 +462,8 @@ pub async fn search_ytmusic(query: &str) -> anyhow::Result<Vec<Track>> {
         "query": query,
     });
 
-    let url = "https://music.youtube.com/youtubei/v1/search?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+    let url =
+        "https://music.youtube.com/youtubei/v1/search?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 
     let resp = ytm_client()
         .post(url)
@@ -437,12 +476,21 @@ pub async fn search_ytmusic(query: &str) -> anyhow::Result<Vec<Track>> {
 
     let status = resp.status();
     if !status.is_success() {
-        anyhow::bail!("YouTube Music HTTP {}: {}", status, resp.text().await.unwrap_or_default());
+        anyhow::bail!(
+            "YouTube Music HTTP {}: {}",
+            status,
+            resp.text().await.unwrap_or_default()
+        );
     }
 
     let text = resp.text().await?;
-    let root: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("YouTube Music parse error: {} | body: {}", e, &text[..text.len().min(500)]))?;
+    let root: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "YouTube Music parse error: {} | body: {}",
+            e,
+            &text[..text.len().min(500)]
+        )
+    })?;
 
     let mut tracks = Vec::new();
     collect_ytm_tracks(&root, &mut tracks);
@@ -473,17 +521,21 @@ fn collect_ytm_tracks(value: &serde_json::Value, out: &mut Vec<Track>) {
 }
 
 fn ytm_item_to_track(item: &serde_json::Value) -> Option<Track> {
-    let video_id = item.get("playlistItemData")
+    let video_id = item
+        .get("playlistItemData")
         .and_then(|p| p.get("videoId"))
         .and_then(|v| v.as_str())
-        .or_else(|| item.get("navigationEndpoint")
-            .and_then(|n| n.get("watchEndpoint"))
-            .and_then(|w| w.get("videoId"))
-            .and_then(|v| v.as_str()))
+        .or_else(|| {
+            item.get("navigationEndpoint")
+                .and_then(|n| n.get("watchEndpoint"))
+                .and_then(|w| w.get("videoId"))
+                .and_then(|v| v.as_str())
+        })
         .map(|s| s.to_string())?;
 
     let columns = item.get("flexColumns")?.as_array()?;
-    let title = columns.get(0)?
+    let title = columns
+        .get(0)?
         .pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs")
         .and_then(|r| r.as_array())?
         .first()?
@@ -491,16 +543,26 @@ fn ytm_item_to_track(item: &serde_json::Value) -> Option<Track> {
         .as_str()?
         .to_string();
 
-    let subtitle_runs: Vec<String> = columns.get(1)
+    let subtitle_runs: Vec<String> = columns
+        .get(1)
         .and_then(|col| col.pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs"))
         .and_then(|r| r.as_array())
-        .map(|runs| runs.iter()
-            .filter_map(|r| r.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
-            .collect())
+        .map(|runs| {
+            runs.iter()
+                .filter_map(|r| {
+                    r.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        })
         .unwrap_or_default();
 
     let is_typed = subtitle_runs.first().map_or(false, |s| {
-        matches!(s.as_str(), "Song" | "Video" | "Artist" | "Album" | "Single" | "Episode")
+        matches!(
+            s.as_str(),
+            "Song" | "Video" | "Artist" | "Album" | "Single" | "Episode"
+        )
     });
     let artist_runs: Box<dyn Iterator<Item = &String>> = if is_typed {
         Box::new(subtitle_runs.iter().skip(1))
@@ -510,28 +572,40 @@ fn ytm_item_to_track(item: &serde_json::Value) -> Option<Track> {
 
     let artist = artist_runs
         .map(|s| s.trim())
-        .filter(|s| !s.is_empty() && *s != "•" && *s != "," && *s != "&"
-            && !s.contains("views") && !s.contains("subscribers") && !s.contains("years ago")
-            && !s.chars().all(|c| c.is_ascii_digit() || c == ':' || c == ' '))
+        .filter(|s| {
+            !s.is_empty()
+                && *s != "•"
+                && *s != ","
+                && *s != "&"
+                && !s.contains("views")
+                && !s.contains("subscribers")
+                && !s.contains("years ago")
+                && !s
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == ':' || c == ' ')
+        })
         .collect::<Vec<_>>()
         .join(" ");
-    let artist = if artist.is_empty() { "Unknown".to_string() } else { artist };
+    let artist = if artist.is_empty() {
+        "Unknown".to_string()
+    } else {
+        artist
+    };
 
-    let duration_ms = subtitle_runs.iter()
-        .rev()
-        .find_map(|s| {
-            let s = s.trim();
-            let parts: Vec<&str> = s.split(':').collect();
-            if parts.len() == 2 {
-                let min: u64 = parts[0].parse().ok()?;
-                let sec: u64 = parts[1].parse().ok()?;
-                Some((min * 60 + sec) * 1000)
-            } else {
-                None
-            }
-        });
+    let duration_ms = subtitle_runs.iter().rev().find_map(|s| {
+        let s = s.trim();
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() == 2 {
+            let min: u64 = parts[0].parse().ok()?;
+            let sec: u64 = parts[1].parse().ok()?;
+            Some((min * 60 + sec) * 1000)
+        } else {
+            None
+        }
+    });
 
-    let artwork_url = item.get("thumbnail")
+    let artwork_url = item
+        .get("thumbnail")
         .and_then(|t| t.get("musicThumbnailRenderer"))
         .and_then(|t| t.get("thumbnail"))
         .and_then(|t| t.get("thumbnails"))
@@ -554,7 +628,7 @@ fn ytm_item_to_track(item: &serde_json::Value) -> Option<Track> {
     })
 }
 
-// ========== YouTube Music metadata via ytmusicapi (Python) ==========
+// ========== metadata via Python helper (ytmeta.py) ==========
 
 #[derive(Debug, Clone)]
 pub struct YtMeta {
@@ -572,22 +646,29 @@ fn ytmeta_script() -> Option<std::path::PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
-/// Fetch accurate duration + big artwork for a YouTube Music video via ytmusicapi.
-pub async fn get_ytmeta(video_id: &str) -> Option<YtMeta> {
-    let id = video_id.to_string();
+/// Fetch accurate duration + big artwork for any source via the Python helper.
+/// `extra` is the Yandex OAuth token or the SoundCloud client_id.
+pub async fn get_meta(source: Source, id: &str, extra: Option<&str>) -> Option<YtMeta> {
     let script = ytmeta_script()?;
+    let src = match source {
+        Source::YouTubeMusic => "ytmusic",
+        Source::ITunes => "itunes",
+        Source::SoundCloud => "soundcloud",
+        Source::YandexMusic => "yandex",
+    };
+    let id = id.to_string();
+    let extra = extra.map(|s| s.to_string());
     tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new("python3");
         let venv = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".venv/bin/python");
         if venv.exists() {
             cmd = std::process::Command::new(venv);
         }
-        let output = cmd
-            .arg(&script)
-            .arg("song")
-            .arg(&id)
-            .output()
-            .ok()?;
+        cmd.arg(&script).arg(src).arg(&id);
+        if let Some(e) = &extra {
+            cmd.arg(e);
+        }
+        let output = cmd.output().ok()?;
         if !output.status.success() {
             return None;
         }
@@ -597,8 +678,14 @@ pub async fn get_ytmeta(video_id: &str) -> Option<YtMeta> {
             return None;
         }
         Some(YtMeta {
-            duration_ms: v.get("duration_ms").and_then(|d| d.as_u64()).filter(|d| *d > 0),
-            artwork_url: v.get("artwork_url").and_then(|a| a.as_str()).map(|s| s.to_string()),
+            duration_ms: v
+                .get("duration_ms")
+                .and_then(|d| d.as_u64())
+                .filter(|d| *d > 0),
+            artwork_url: v
+                .get("artwork_url")
+                .and_then(|a| a.as_str())
+                .map(|s| s.to_string()),
         })
     })
     .await
@@ -679,10 +766,19 @@ pub async fn get_mb_metadata(artist: &str, title: &str) -> Result<Option<MbMeta>
     let release = rec.releases.first();
 
     let album = release.and_then(|r| {
-        if r.title.is_empty() { None } else { Some(r.title.clone()) }
+        if r.title.is_empty() {
+            None
+        } else {
+            Some(r.title.clone())
+        }
     });
     let year = release.and_then(|r| {
-        r.date.chars().take(4).collect::<String>().parse::<u16>().ok()
+        r.date
+            .chars()
+            .take(4)
+            .collect::<String>()
+            .parse::<u16>()
+            .ok()
     });
 
     if album.is_none() && year.is_none() {
@@ -719,7 +815,11 @@ struct LastfmArtist {
     name: String,
 }
 
-pub async fn lastfm_similar(api_key: &str, artist: &str, title: &str) -> Result<Vec<(String, String)>, String> {
+pub async fn lastfm_similar(
+    api_key: &str,
+    artist: &str,
+    title: &str,
+) -> Result<Vec<(String, String)>, String> {
     let url = format!(
         "https://ws.audioscrobbler.com/2.0/?method=track.getsimilar&artist={}&track={}&api_key={}&format=json&limit=25",
         urlencoding::encode(artist),
@@ -733,7 +833,9 @@ pub async fn lastfm_similar(api_key: &str, artist: &str, title: &str) -> Result<
     }
 
     let body: LastfmSimilarResponse = resp.json().await.map_err(|e| e.to_string())?;
-    let similar: Vec<(String, String)> = body.similartracks.track
+    let similar: Vec<(String, String)> = body
+        .similartracks
+        .track
         .into_iter()
         .filter(|t| !t.name.is_empty() && !t.artist.name.is_empty())
         .map(|t| (t.artist.name, t.name))
@@ -758,7 +860,10 @@ pub async fn get_lyrics(artist: &str, title: &str) -> Result<Option<Vec<(u64, St
     );
     let resp = reqwest::Client::new()
         .get(&url)
-        .header("User-Agent", "larp-music-player/0.1 (https://github.com/opencode)")
+        .header(
+            "User-Agent",
+            "larp-music-player/0.1 (https://github.com/opencode)",
+        )
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -833,7 +938,10 @@ fn norm(s: &str) -> String {
         .collect()
 }
 
-pub async fn get_netease_lyrics(artist: &str, title: &str) -> Result<Option<Vec<(u64, String)>>, String> {
+pub async fn get_netease_lyrics(
+    artist: &str,
+    title: &str,
+) -> Result<Option<Vec<(u64, String)>>, String> {
     let query = if title.is_empty() { artist } else { title };
 
     let client = reqwest::Client::new();
@@ -841,7 +949,10 @@ pub async fn get_netease_lyrics(artist: &str, title: &str) -> Result<Option<Vec<
         .post("https://music.163.com/api/cloudsearch/pc")
         .form(&[("s", query), ("type", "1"), ("limit", "10")])
         .header("Referer", "https://music.163.com/")
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        )
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -873,7 +984,10 @@ pub async fn get_netease_lyrics(artist: &str, title: &str) -> Result<Option<Vec<
             song_id
         ))
         .header("Referer", "https://music.163.com/")
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        )
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -902,10 +1016,20 @@ pub fn parse_lrc(lrc: &str) -> Vec<(u64, String)> {
             let m = cap.get(0).unwrap();
             let min: u64 = cap[1].parse().unwrap_or(0);
             let sec: u64 = cap[2].parse().unwrap_or(0);
-            let frac: u64 = cap.get(3).map(|f| f.as_str().parse().unwrap_or(0)).unwrap_or(0);
+            let frac: u64 = cap
+                .get(3)
+                .map(|f| f.as_str().parse().unwrap_or(0))
+                .unwrap_or(0);
             let flen = cap.get(3).map(|f| f.as_str().len()).unwrap_or(0);
-            let ms = min * 60000 + sec * 1000
-                + if flen == 1 { frac * 100 } else if flen == 2 { frac * 10 } else { frac };
+            let ms = min * 60000
+                + sec * 1000
+                + if flen == 1 {
+                    frac * 100
+                } else if flen == 2 {
+                    frac * 10
+                } else {
+                    frac
+                };
             times.push(ms);
             last_end = m.end();
         }
@@ -931,7 +1055,10 @@ mod tests {
     #[test]
     fn lrc_single_timestamp() {
         let lines = parse_lrc("[00:19.16] When you were here before");
-        assert_eq!(lines, vec![(19160, "When you were here before".to_string())]);
+        assert_eq!(
+            lines,
+            vec![(19160, "When you were here before".to_string())]
+        );
     }
 
     #[test]

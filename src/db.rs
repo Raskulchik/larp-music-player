@@ -1,6 +1,6 @@
-use rusqlite::{Connection, params};
-use std::path::PathBuf;
 use crate::api::{Source, Track};
+use rusqlite::{params, Connection};
+use std::path::PathBuf;
 
 fn db_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -62,7 +62,7 @@ impl Database {
                 position INTEGER NOT NULL,
                 FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE,
                 UNIQUE(playlist_id, source, track_id)
-            );"
+            );",
         )?;
 
         Ok(Self { conn })
@@ -121,7 +121,13 @@ impl Database {
     }
 
     /// Patch duration_ms / artwork_url on an existing liked row (used to fix `??:??`).
-    pub fn update_liked_meta(&self, source: &Source, track_id: &str, duration_ms: Option<u64>, artwork_url: Option<&str>) -> anyhow::Result<()> {
+    pub fn update_liked_meta(
+        &self,
+        source: &Source,
+        track_id: &str,
+        duration_ms: Option<u64>,
+        artwork_url: Option<&str>,
+    ) -> anyhow::Result<()> {
         let source_str = match source {
             Source::YandexMusic => "yandex",
             Source::ITunes => "itunes",
@@ -141,35 +147,35 @@ impl Database {
             "SELECT source, track_id, title, artist, artwork_url, duration_ms, preview_url FROM liked ORDER BY liked_at DESC"
         )?;
 
-        let tracks = stmt.query_map([], |row| {
-            let source_str: String = row.get(0)?;
-            let source = match source_str.as_str() {
-                "yandex" => Source::YandexMusic,
-                "soundcloud" => Source::SoundCloud,
-                "ytmusic" => Source::YouTubeMusic,
-                _ => Source::ITunes,
-            };
-            Ok(Track {
-                id: row.get(1)?,
-                title: row.get(2)?,
-                artist: row.get(3)?,
-                source,
-                artwork_url: row.get(4)?,
-                duration_ms: row.get::<_, Option<i64>>(5)?.map(|d| d as u64),
-                preview_url: row.get(6)?,
-                album: None,
-                year: None,
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let tracks = stmt
+            .query_map([], |row| {
+                let source_str: String = row.get(0)?;
+                let source = match source_str.as_str() {
+                    "yandex" => Source::YandexMusic,
+                    "soundcloud" => Source::SoundCloud,
+                    "ytmusic" => Source::YouTubeMusic,
+                    _ => Source::ITunes,
+                };
+                Ok(Track {
+                    id: row.get(1)?,
+                    title: row.get(2)?,
+                    artist: row.get(3)?,
+                    source,
+                    artwork_url: row.get(4)?,
+                    duration_ms: row.get::<_, Option<i64>>(5)?.map(|d| d as u64),
+                    preview_url: row.get(6)?,
+                    album: None,
+                    year: None,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(tracks)
     }
 
     pub fn create_playlist(&self, name: &str) -> anyhow::Result<i64> {
-        self.conn.execute(
-            "INSERT INTO playlists (name) VALUES (?1)",
-            params![name],
-        )?;
+        self.conn
+            .execute("INSERT INTO playlists (name) VALUES (?1)", params![name])?;
         Ok(self.conn.last_insert_rowid())
     }
 
@@ -177,20 +183,23 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT p.id, p.name,
                     (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) AS cnt
-             FROM playlists p ORDER BY p.created_at DESC"
+             FROM playlists p ORDER BY p.created_at DESC",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(Playlist {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                count: row.get::<_, i64>(2)? as usize,
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(Playlist {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    count: row.get::<_, i64>(2)? as usize,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
     pub fn delete_playlist(&self, id: i64) -> anyhow::Result<()> {
-        self.conn.execute("DELETE FROM playlists WHERE id = ?1", params![id])?;
+        self.conn
+            .execute("DELETE FROM playlists WHERE id = ?1", params![id])?;
         Ok(())
     }
 
@@ -225,7 +234,12 @@ impl Database {
         Ok(())
     }
 
-    pub fn remove_from_playlist(&self, playlist_id: i64, source: &Source, track_id: &str) -> anyhow::Result<()> {
+    pub fn remove_from_playlist(
+        &self,
+        playlist_id: i64,
+        source: &Source,
+        track_id: &str,
+    ) -> anyhow::Result<()> {
         let source_str = match source {
             Source::YandexMusic => "yandex",
             Source::ITunes => "itunes",
@@ -242,28 +256,30 @@ impl Database {
     pub fn get_playlist_tracks(&self, playlist_id: i64) -> anyhow::Result<Vec<Track>> {
         let mut stmt = self.conn.prepare(
             "SELECT source, track_id, title, artist, artwork_url, duration_ms, preview_url
-             FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY position ASC"
+             FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY position ASC",
         )?;
-        let tracks = stmt.query_map(params![playlist_id], |row| {
-            let source_str: String = row.get(0)?;
-            let source = match source_str.as_str() {
-                "yandex" => Source::YandexMusic,
-                "soundcloud" => Source::SoundCloud,
-                "ytmusic" => Source::YouTubeMusic,
-                _ => Source::ITunes,
-            };
-            Ok(Track {
-                id: row.get(1)?,
-                title: row.get(2)?,
-                artist: row.get(3)?,
-                source,
-                artwork_url: row.get(4)?,
-                duration_ms: row.get::<_, Option<i64>>(5)?.map(|d| d as u64),
-                preview_url: row.get(6)?,
-                album: None,
-                year: None,
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let tracks = stmt
+            .query_map(params![playlist_id], |row| {
+                let source_str: String = row.get(0)?;
+                let source = match source_str.as_str() {
+                    "yandex" => Source::YandexMusic,
+                    "soundcloud" => Source::SoundCloud,
+                    "ytmusic" => Source::YouTubeMusic,
+                    _ => Source::ITunes,
+                };
+                Ok(Track {
+                    id: row.get(1)?,
+                    title: row.get(2)?,
+                    artist: row.get(3)?,
+                    source,
+                    artwork_url: row.get(4)?,
+                    duration_ms: row.get::<_, Option<i64>>(5)?.map(|d| d as u64),
+                    preview_url: row.get(6)?,
+                    album: None,
+                    year: None,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(tracks)
     }
 }
@@ -295,7 +311,8 @@ mod tests {
         assert_eq!(tracks.len(), 1, "duplicate track added twice");
         let pls = db.get_playlists().expect("get playlists");
         assert!(pls.iter().any(|p| p.id == id && p.count == 1));
-        db.remove_from_playlist(id, &track.source, &track.id).expect("remove");
+        db.remove_from_playlist(id, &track.source, &track.id)
+            .expect("remove");
         assert_eq!(db.get_playlist_tracks(id).expect("count").len(), 0);
         db.delete_playlist(id).expect("delete");
         assert!(!db.get_playlists().expect("list").iter().any(|p| p.id == id));

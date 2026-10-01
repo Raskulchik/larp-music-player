@@ -43,7 +43,15 @@ impl DiscordRpc {
         Some(Self { cmd_tx })
     }
 
-    pub fn set_activity(&self, title: &str, artist: &str, _source: &str, artwork_url: Option<&str>, duration_ms: Option<u64>, state: &str) {
+    pub fn set_activity(
+        &self,
+        title: &str,
+        artist: &str,
+        _source: &str,
+        artwork_url: Option<&str>,
+        duration_ms: Option<u64>,
+        state: &str,
+    ) {
         let _ = self.cmd_tx.send(RpcCommand::SetActivity {
             title: title.to_string(),
             artist: artist.to_string(),
@@ -104,8 +112,18 @@ fn run_rpc_loop(client_id: &str, cmd_rx: mpsc::Receiver<RpcCommand>) {
         match cmd_rx.recv_timeout(std::time::Duration::from_secs(1)) {
             Ok(cmd) => {
                 let apply: Option<RpcCommand> = match &cmd {
-                    RpcCommand::SetState { state, position_ms, show_timer } => match &pending_activity {
-                        Some(RpcCommand::SetActivity { title, artist, artwork_url, duration_ms, .. }) => {
+                    RpcCommand::SetState {
+                        state,
+                        position_ms,
+                        show_timer,
+                    } => match &pending_activity {
+                        Some(RpcCommand::SetActivity {
+                            title,
+                            artist,
+                            artwork_url,
+                            duration_ms,
+                            ..
+                        }) => {
                             let upd = RpcCommand::SetActivity {
                                 title: title.clone(),
                                 artist: artist.clone(),
@@ -138,9 +156,20 @@ fn run_rpc_loop(client_id: &str, cmd_rx: mpsc::Receiver<RpcCommand>) {
     }
 }
 
-fn apply_command(client: &mut DiscordIpcClient, cmd: &RpcCommand) -> Result<(), Box<dyn std::error::Error>> {
+fn apply_command(
+    client: &mut DiscordIpcClient,
+    cmd: &RpcCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        RpcCommand::SetActivity { title, artist, artwork_url, duration_ms, state, position_ms, show_timer } => {
+        RpcCommand::SetActivity {
+            title,
+            artist,
+            artwork_url,
+            duration_ms,
+            state,
+            position_ms,
+            show_timer,
+        } => {
             let mut assets = activity::Assets::new();
             if let Some(url) = artwork_url {
                 assets = assets.large_image(url);
@@ -160,7 +189,8 @@ fn apply_command(client: &mut DiscordIpcClient, cmd: &RpcCommand) -> Result<(), 
                         .as_millis() as i64;
                     let start = now - position_ms.unwrap_or(0).min(*dur) as i64;
                     let end = start + *dur as i64;
-                    activity = activity.timestamps(activity::Timestamps::new().start(start).end(end));
+                    activity =
+                        activity.timestamps(activity::Timestamps::new().start(start).end(end));
                 }
             }
 
