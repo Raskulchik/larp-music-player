@@ -378,8 +378,9 @@ async fn download_ytmusic(track_id: &str, dest: &std::path::Path) -> Result<(), 
                 "mp3",
                 "--audio-quality",
                 "128K",
+                "-f",
+                "bestaudio",
             ])
-            .args(["--extractor-args", "youtube:player_client=mweb"])
             .args(["--force-overwrites"])
             .args(["-o", &format!("{}.%(ext)s", dest_path)])
             .arg(&track_url)
@@ -389,6 +390,7 @@ async fn download_ytmusic(track_id: &str, dest: &std::path::Path) -> Result<(), 
             Ok(())
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            dlog!("download_ytmusic failed: {}", stderr.trim());
             Err(stderr
                 .lines()
                 .rev()
@@ -612,8 +614,9 @@ fn play_track(
                                     "mp3",
                                     "--audio-quality",
                                     "128K",
+                                    "-f",
+                                    "bestaudio",
                                 ])
-                                .args(["--extractor-args", "youtube:player_client=mweb"])
                                 .args(["--force-overwrites"])
                                 .args(["-o", &tmp_path])
                                 .arg(format!("https://music.youtube.com/watch?v={}", track_id))
@@ -630,6 +633,7 @@ fn play_track(
                                     tx.send(player::PlayerCommand::PlayFile(tmp_path, vol, gen));
                             } else {
                                 let stderr = String::from_utf8_lossy(&output.stderr);
+                                dlog!("ytmusic yt-dlp failed: {}", stderr.trim());
                                 let msg = if stderr.contains("DRM protected") {
                                     "DRM protected — not available".to_string()
                                 } else {
