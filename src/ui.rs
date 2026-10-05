@@ -38,6 +38,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ViewMode::Playlists if app.active_playlist_id.is_none() => {
             draw_playlist_list(f, app, chunks[2])
         }
+        ViewMode::Stats => draw_stats(f, app, chunks[2]),
         _ => draw_tracklist(f, app, chunks[2]),
     }
     draw_player(f, app, chunks[3]);
@@ -85,6 +86,7 @@ fn draw_view_select(f: &mut Frame, app: &App) {
         ("Liked", ViewMode::Liked),
         ("Lyrics", ViewMode::Lyrics),
         ("Playlists", ViewMode::Playlists),
+        ("Stats", ViewMode::Stats),
     ];
     let items: Vec<Line> = views
         .iter()
@@ -153,6 +155,7 @@ fn draw_help(f: &mut Frame, _app: &App) {
         ("Enter", "play / open"),
         ("Space", "play / pause"),
         ("Esc", "back / close"),
+        ("m", "stats: switch ranking"),
         (" u", "check for updates"),
     ]
     .iter()
@@ -235,6 +238,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         ViewMode::Liked => "liked",
         ViewMode::Lyrics => "lyrics",
         ViewMode::Playlists => "playlists",
+        ViewMode::Stats => "stats",
     };
 
     let hint = "Shift+H help";
@@ -430,7 +434,7 @@ fn draw_tracklist(f: &mut Frame, app: &mut App, area: Rect) {
             ViewMode::Search => "  no tracks — press / to search",
             ViewMode::Liked => "  no liked songs — press L to like",
             ViewMode::Playlists => "  empty playlist — Shift+A to add tracks",
-            ViewMode::Lyrics => "",
+            ViewMode::Lyrics | ViewMode::Stats => "",
         };
         let empty = Paragraph::new(msg).style(Style::default().fg(Color::DarkGray));
         f.render_widget(empty, area);
@@ -445,6 +449,7 @@ fn draw_tracklist(f: &mut Frame, app: &mut App, area: Rect) {
             .map(Cow::Owned)
             .unwrap_or_else(|| "playlist".into()),
         ViewMode::Lyrics => "lyrics".into(),
+        ViewMode::Stats => "stats".into(),
     };
 
     let playing_id = if app.is_playing {
@@ -541,12 +546,20 @@ fn draw_tracklist(f: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(Color::Gray)
         };
 
+        let plays = app.play_count_for(&track.source, &track.id);
+        let play_badge = if plays > 0 {
+            Span::styled(format!("  ▶{}", plays), Style::default().fg(Color::Magenta))
+        } else {
+            Span::raw("")
+        };
+
         let line = Line::from(vec![
             indicator,
             heart,
             Span::styled(&track.artist, name_style.clone()),
             Span::styled(" — ", Style::default().fg(Color::DarkGray)),
             Span::styled(&track.title, name_style),
+            play_badge,
             Span::styled(
                 format!("  {}", duration),
                 Style::default().fg(Color::DarkGray),
@@ -572,6 +585,132 @@ fn draw_tracklist(f: &mut Frame, app: &mut App, area: Rect) {
         let paragraph = Paragraph::new(line).block(block);
         f.render_widget(paragraph, item_area);
     }
+}
+
+fn draw_stats(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::db::{fmt_listened, TopBy};
+
+    let totals = app.db.stats_totals().unwrap_or_default();
+
+    let mut lines: Vec<Line> = Vec::new();
+    let dim = Style::default().fg(Color::DarkGray);
+    let head = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let val = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+
+    if totals.plays == 0 {
+        let p = Paragraph::new("  no listening history yet — play something")
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(p, area);
+        return;
+    }
+
+    lines.push(Line::from(Span::styled("Totals", head)));
+    lines.push(Line::from(vec![
+        Span::styled("  listened ", dim),
+        Span::styled(fmt_listened(totals.listened_ms), val),
+        Span::styled("   plays ", dim),
+        Span::styled(totals.plays.to_string(), val),
+        Span::styled("   tracks ", dim),
+        Span::styled(totals.tracks.to_string(), val),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  finished ", dim),
+        Span::styled(totals.completed.to_string(), val),
+        Span::styled("   active days ", dim),
+        Span::styled(totals.days.to_string(), val),
+    ]));
+    if let Some(first) = &totals.first_day {
+        lines.push(Line::from(Span::styled(format!("  since {}", first), dim)));
+    }
+
+    let by = app.stats_top_by;
+    let title = match by {
+        TopBy::Plays => "Most played",
+        TopBy::Listened => "Most listened",
+        TopBy::Completed => "Most finished",
+    };
+    let hint = match by {
+        TopBy::Completed => "  (m: most played / listened / finished)",
+        _ => "  (m: most played / listened / finished)",
+    };
+    lines.push(Line::from(Span::styled(
+        format!("\n{}{}", title, hint),
+        head,
+    )));
+
+    if let Ok(rows) = app.db.top_tracks(by, 10) {
+        if rows.is_empty() {
+            lines.push(Line::from(Span::styled("  nothing yet", dim)));
+        }
+        let label_of = |r: &crate::db::TrackStat| {
+            if r.title.is_empty() {
+                format!("{} {}", source_label(&r.source), r.track_id)
+            } else if r.artist.is_empty() {
+                r.title.clone()
+            } else {
+                format!("{} \u{2014} {}", r.artist, r.title)
+            }
+        };
+        let longest = rows
+            .iter()
+            .map(|r| label_of(r).chars().count())
+            .max()
+            .unwrap_or(10);
+        for (i, r) in rows.iter().enumerate() {
+            let num = format!("{:>2}.", i + 1);
+            let title_txt = format!(
+                " {:<width$} ",
+                label_of(r).chars().take(longest).collect::<String>(),
+                width = longest
+            );
+            let meta = match by {
+                TopBy::Listened => {
+                    format!("{} · {} plays", fmt_listened(r.listened_ms), r.play_count)
+                }
+                TopBy::Completed => format!("{} · {} plays", r.completed_count, r.play_count),
+                TopBy::Plays => format!("{} · {}", r.play_count, fmt_listened(r.listened_ms)),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(num, dim),
+                Span::raw(title_txt),
+                Span::styled(source_label(&r.source).to_string(), dim),
+                Span::styled(format!("  {}", meta), Style::default().fg(Color::Green)),
+                Span::styled(
+                    format!("  \u{293c}{}", r.skip_count),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+    }
+
+    if let Ok(days) = app.db.daily_stats(7) {
+        if !days.is_empty() {
+            lines.push(Line::from(Span::styled("\nLast days", head)));
+            let peak = days.iter().map(|d| d.listened_ms).max().unwrap_or(1).max(1);
+            let width = (area.width.saturating_sub(34)).clamp(4, 40) as usize;
+            for d in days {
+                let bars = ((d.listened_ms as f64 / peak as f64) * width as f64) as usize;
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {} ", d.day), dim),
+                    Span::styled(
+                        "█".repeat(bars.max(usize::from(d.listened_ms > 0))),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(
+                        format!("  {} · {} plays", fmt_listened(d.listened_ms), d.plays),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
+    }
+
+    let p = Paragraph::new(lines).scroll((app.stats_scroll, 0));
+    f.render_widget(p, area);
 }
 
 fn draw_lyrics(f: &mut Frame, app: &App, area: Rect) {

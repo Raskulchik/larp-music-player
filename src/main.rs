@@ -876,10 +876,18 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                         KeyCode::Tab => app.start_view_select(),
                                         KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('л') => {
-                                            app.prev()
+                                            if app.view_mode == app::ViewMode::Stats {
+                                                app.scroll_stats_up();
+                                            } else {
+                                                app.prev()
+                                            }
                                         }
                                         KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('о') => {
-                                            app.next()
+                                            if app.view_mode == app::ViewMode::Stats {
+                                                app.scroll_stats_down();
+                                            } else {
+                                                app.next()
+                                            }
                                         }
                                         KeyCode::Char(' ') => match app.toggle_play() {
                                             PlayAction::Pause => {
@@ -957,6 +965,11 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                         KeyCode::Char('g') | KeyCode::Char('п') => {
                                             app.toggle_lyrics();
+                                        }
+                                        KeyCode::Char('m') | KeyCode::Char('ь') => {
+                                            if app.view_mode == app::ViewMode::Stats {
+                                                app.cycle_stats_metric();
+                                            }
                                         }
                                         KeyCode::Char('x') | KeyCode::Char('ч') => {
                                             if app.view_mode == app::ViewMode::Liked {
@@ -1537,6 +1550,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    app.flush_stats();
     let _ = player_tx.send(player::PlayerCommand::Stop);
     drop(player_tx);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), player_handle).await;

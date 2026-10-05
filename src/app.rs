@@ -70,6 +70,7 @@ pub enum ViewMode {
     Liked,
     Lyrics,
     Playlists,
+    Stats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -134,6 +135,17 @@ pub struct App {
     pub active_playlist_id: Option<i64>,
     pub name_input: String,
     pub update_available: Option<String>,
+    /// Listening stats accumulator (wall-clock, immune to seeking).
+    listen_accum_ms: u64,
+    listen_mark: Option<std::time::Instant>,
+    pending_stats_track: Option<Track>,
+    pending_started: bool,
+    pending_completed: bool,
+    /// Which ranking the stats view shows.
+    pub stats_top_by: crate::db::TopBy,
+    pub stats_scroll: u16,
+    /// Cached play counts so the track list does not query per row.
+    play_counts: std::collections::HashMap<(String, String), u32>,
     cmd_tx: mpsc::UnboundedSender<Command>,
 }
 
@@ -144,10 +156,26 @@ impl App {
         saved_sc_client_id: Option<String>,
         saved_liked_shuffle: bool,
     ) -> Self {
+        let db = Database::open().expect("Failed to open database");
+        Self::with_db(
+            cmd_tx,
+            saved_token,
+            saved_sc_client_id,
+            saved_liked_shuffle,
+            db,
+        )
+    }
+
+    pub fn with_db(
+        cmd_tx: mpsc::UnboundedSender<Command>,
+        saved_token: Option<String>,
+        saved_sc_client_id: Option<String>,
+        saved_liked_shuffle: bool,
+        db: Database,
+    ) -> Self {
         let has_token = saved_token.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
         let token = saved_token.unwrap_or_default();
         let sc_client_id = saved_sc_client_id.unwrap_or_default();
-        let db = Database::open().expect("Failed to open database");
 
         Self {
             tracks: Vec::new(),
@@ -195,6 +223,14 @@ impl App {
             active_playlist_id: None,
             name_input: String::new(),
             update_available: None,
+            listen_accum_ms: 0,
+            listen_mark: None,
+            pending_stats_track: None,
+            pending_started: false,
+            pending_completed: false,
+            stats_top_by: crate::db::TopBy::Plays,
+            stats_scroll: 0,
+            play_counts: std::collections::HashMap::new(),
             cmd_tx,
         }
     }
@@ -211,6 +247,130 @@ impl App {
     pub fn note_playing(&mut self) {
         self.playing_track_id = self.current_track_id();
         self.playing_track = self.current_track().cloned();
+    }
+
+    // ---------- listening statistics ----------
+
+    /// Begin counting wall-clock listening time. Idempotent.
+    fn listen_mark_start(&mut self) {
+        if self.listen_mark.is_none() {
+            self.listen_mark = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Fold the active segment into the accumulator.
+    fn listen_accum(&mut self) {
+        if let Some(mark) = self.listen_mark.take() {
+            self.listen_accum_ms += mark.elapsed().as_millis() as u64;
+        }
+    }
+
+    /// A new stream actually started: attribute stats to this track.
+    fn stats_begin_track(&mut self) {
+        self.stats_persist_pending();
+
+        // Now start accounting for the track that is playing.
+        let current = match self
+            .playing_track
+            .clone()
+            .or_else(|| self.current_track().cloned())
+        {
+            Some(t) => t,
+            None => return,
+        };
+        let _ = self.db.record_play_start(
+            &current.source,
+            &current.id,
+            &current.title,
+            &current.artist,
+        );
+        let key = (
+            crate::db::source_key(&current.source).to_string(),
+            current.id.clone(),
+        );
+        *self.play_counts.entry(key).or_insert(0) += 1;
+        self.pending_stats_track = Some(current);
+        self.pending_started = true;
+        self.pending_completed = false;
+        self.listen_accum_ms = 0;
+        self.listen_mark_start();
+    }
+
+    /// The track played to its end.
+    fn stats_finish_track(&mut self) {
+        self.listen_accum();
+        self.pending_completed = true;
+        self.stats_persist_pending();
+    }
+
+    /// Write out the pending track's numbers and stop accounting for it.
+    fn stats_persist_pending(&mut self) {
+        self.listen_accum();
+        let ms = std::mem::take(&mut self.listen_accum_ms);
+        if let Some(track) = self.pending_stats_track.take() {
+            if ms > 0 {
+                let _ = self.db.record_listened(&track.source, &track.id, ms);
+            }
+            if self.pending_completed {
+                let _ = self.db.record_completed(&track.source, &track.id);
+            } else if self.pending_started {
+                let _ = self.db.record_skipped(&track.source, &track.id);
+            }
+        }
+        self.pending_started = false;
+        self.pending_completed = false;
+    }
+
+    /// Called before the queue moves on, so partial listens are not lost.
+    pub fn flush_stats(&mut self) {
+        if self.pending_started {
+            self.stats_persist_pending();
+        } else {
+            self.listen_accum();
+        }
+    }
+
+    pub fn scroll_stats_down(&mut self) {
+        self.stats_scroll = self.stats_scroll.saturating_add(1);
+    }
+
+    pub fn scroll_stats_up(&mut self) {
+        self.stats_scroll = self.stats_scroll.saturating_sub(1);
+    }
+
+    /// Reload the cached per-track play counts.
+    pub fn refresh_play_counts(&mut self) {
+        self.play_counts = self.db.play_counts().unwrap_or_default();
+    }
+
+    /// How many times a track was played (from the cache).
+    pub fn play_count_for(&self, source: &Source, track_id: &str) -> u32 {
+        self.play_counts
+            .get(&(
+                crate::db::source_key(source).to_string(),
+                track_id.to_string(),
+            ))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Cycle the ranking shown in the stats view.
+    pub fn cycle_stats_metric(&mut self) {
+        use crate::db::TopBy;
+        self.stats_top_by = match self.stats_top_by {
+            TopBy::Plays => TopBy::Listened,
+            TopBy::Listened => TopBy::Completed,
+            TopBy::Completed => TopBy::Plays,
+        };
+        self.stats_scroll = 0;
+        self.status_message = format!(
+            "Stats ranking: {}",
+            match self.stats_top_by {
+                TopBy::Plays => "most played",
+                TopBy::Listened => "most listened",
+                TopBy::Completed => "most finished",
+            }
+        );
     }
 
     pub fn prev(&mut self) {
@@ -246,11 +406,15 @@ impl App {
         self.status_message = "Paused".to_string();
         self.paused_at_ms = self.position_ms();
         self.started_at = None;
+        self.listen_accum();
     }
 
     pub fn resume(&mut self) {
         self.is_playing = true;
         self.status_message = "Playing".to_string();
+        if self.pending_started {
+            self.listen_mark_start();
+        }
         if let Some(paused) = self.paused_at_ms {
             let real = (paused as f64 / self.playback_speed.max(0.01) as f64) as u64;
             self.started_at =
@@ -284,6 +448,7 @@ impl App {
         if self.tracks.is_empty() {
             return;
         }
+        self.flush_stats();
         self.is_playing = true;
         self.loading_play = true;
         self.note_playing();
@@ -304,6 +469,7 @@ impl App {
                 self.resume();
                 PlayAction::Resume
             } else {
+                self.flush_stats();
                 self.note_playing();
                 self.loading_play = true;
                 self.paused_at_ms = None;
@@ -316,6 +482,7 @@ impl App {
         if self.tracks.is_empty() {
             return false;
         }
+        self.flush_stats();
         if self.view_mode == ViewMode::Liked {
             self.current_index = (self.current_index + 1) % self.tracks.len();
         } else if self.shuffle && self.tracks.len() > 1 {
@@ -331,6 +498,7 @@ impl App {
 
     pub fn prev_track(&mut self) -> bool {
         if !self.tracks.is_empty() {
+            self.flush_stats();
             self.current_index = if self.current_index == 0 {
                 self.tracks.len() - 1
             } else {
@@ -507,6 +675,7 @@ impl App {
             ViewMode::Liked => 1,
             ViewMode::Lyrics => 2,
             ViewMode::Playlists => 3,
+            ViewMode::Stats => 4,
         };
         self.input_mode = InputMode::ViewSelect;
     }
@@ -517,7 +686,7 @@ impl App {
                 self.select_index = (self.select_index + 3) % 4;
             }
             InputMode::ViewSelect => {
-                self.select_index = (self.select_index + 3) % 4;
+                self.select_index = (self.select_index + 4) % 5;
             }
             InputMode::PlaylistSelect => {
                 if self.playlists.len() > 0 {
@@ -535,7 +704,7 @@ impl App {
                 self.select_index = (self.select_index + 1) % 4;
             }
             InputMode::ViewSelect => {
-                self.select_index = (self.select_index + 1) % 4;
+                self.select_index = (self.select_index + 1) % 5;
             }
             InputMode::PlaylistSelect => {
                 if !self.playlists.is_empty() {
@@ -595,7 +764,8 @@ impl App {
             0 => ViewMode::Search,
             1 => ViewMode::Liked,
             2 => ViewMode::Lyrics,
-            _ => ViewMode::Playlists,
+            3 => ViewMode::Playlists,
+            _ => ViewMode::Stats,
         };
         self.input_mode = InputMode::Normal;
         match view {
@@ -614,10 +784,16 @@ impl App {
             ViewMode::Playlists => {
                 self.enter_playlists();
             }
+            ViewMode::Stats => {
+                self.view_mode = ViewMode::Stats;
+                self.stats_scroll = 0;
+                self.status_message = "Listening stats — m to switch ranking".to_string();
+            }
         }
     }
 
     pub fn load_liked(&mut self) {
+        self.refresh_play_counts();
         match self.db.get_liked() {
             Ok(mut tracks) => {
                 if self.liked_shuffle {
@@ -970,6 +1146,7 @@ impl App {
                 self.input_mode = InputMode::Normal;
                 self.view_mode = ViewMode::Search;
                 self.radio_active = false;
+                self.refresh_play_counts();
                 self.status_message = format!("Found {} tracks", count);
             }
             Command::SearchError(e) => {
@@ -988,6 +1165,7 @@ impl App {
                 self.started_at = Some(std::time::Instant::now());
                 self.paused_at_ms = None;
                 self.note_playing();
+                self.stats_begin_track();
                 if let Some(dur) = actual_duration_ms {
                     self.track_duration_ms = Some(dur);
                     if let Some(idx) = self.tracks.iter().position(|t| {
@@ -1005,6 +1183,7 @@ impl App {
                 self.started_at = None;
                 self.paused_at_ms = None;
                 self.track_duration_ms = None;
+                self.stats_finish_track();
             }
             Command::PlayError(e) => {
                 self.is_playing = false;
@@ -1148,4 +1327,129 @@ pub enum PlayAction {
     Pause,
     Resume,
     NewTrack,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::Track;
+
+    fn test_db(name: &str) -> Database {
+        let path = std::env::temp_dir().join(format!(
+            "larp_app_test_{}_{}_{}.db",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&path);
+        Database::open_at(path).expect("open temp db")
+    }
+
+    fn track(id: &str) -> Track {
+        Track {
+            id: id.to_string(),
+            title: format!("Title {}", id),
+            artist: "Artist".to_string(),
+            source: Source::YouTubeMusic,
+            preview_url: None,
+            artwork_url: None,
+            duration_ms: Some(180_000),
+            album: None,
+            year: None,
+        }
+    }
+
+    fn app_with(tracks: Vec<Track>) -> (App, mpsc::UnboundedReceiver<Command>) {
+        let db = test_db(&tracks[0].id);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::with_db(tx, None, None, false, db);
+        app.tracks = tracks;
+        app.refresh_play_counts();
+        (app, rx)
+    }
+
+    #[test]
+    fn stats_record_play_listen_and_skip() {
+        let (mut app, _rx) = app_with(vec![track("a"), track("b")]);
+
+        // Track A starts and plays to the end.
+        app.handle_command(Command::PlayStarted {
+            actual_duration_ms: Some(180_000),
+        });
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        app.handle_command(Command::PlaybackFinished);
+
+        let counts = app.db.play_counts().unwrap();
+        assert_eq!(
+            counts.get(&("ytmusic".to_string(), "a".to_string())),
+            Some(&1)
+        );
+        let top = app.db.top_tracks(crate::db::TopBy::Plays, 5).unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(
+            top[0].completed_count, 1,
+            "finished track must count as completed"
+        );
+        assert!(top[0].listened_ms > 0, "listening time must be recorded");
+
+        // Track B starts, then the user skips it.
+        app.next_track();
+        app.handle_command(Command::PlayStarted {
+            actual_duration_ms: Some(180_000),
+        });
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        app.next_track();
+
+        let rows = app.db.top_tracks(crate::db::TopBy::Plays, 5).unwrap();
+        let b = rows
+            .iter()
+            .find(|r| r.track_id == "b")
+            .expect("track b row");
+        assert_eq!(b.play_count, 1);
+        assert_eq!(b.skip_count, 1, "interrupted track must count as skipped");
+        assert_eq!(b.completed_count, 0);
+
+        let totals = app.db.stats_totals().unwrap();
+        assert_eq!(totals.plays, 2);
+        assert_eq!(totals.tracks, 2);
+        assert!(totals.listened_ms > 0);
+    }
+
+    #[test]
+    fn pause_excludes_paused_time_from_listening() {
+        let (mut app, _rx) = app_with(vec![track("p")]);
+
+        app.handle_command(Command::PlayStarted {
+            actual_duration_ms: Some(180_000),
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        app.pause();
+        let after_playing = app.listen_accum_ms;
+        assert!(
+            after_playing > 0,
+            "played time must accumulate before pause"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        app.resume();
+        app.flush_stats();
+
+        let total = app.db.top_tracks(crate::db::TopBy::Listened, 5).unwrap()[0].listened_ms;
+        assert!(
+            total < 150,
+            "paused wall-clock time must not be counted as listening (got {}ms)",
+            total
+        );
+    }
+
+    #[test]
+    fn no_stats_written_without_playback() {
+        let (mut app, _rx) = app_with(vec![track("q")]);
+        app.flush_stats();
+        assert_eq!(app.db.play_counts().unwrap().len(), 0);
+        assert_eq!(app.db.stats_totals().unwrap().plays, 0);
+    }
 }
