@@ -6,6 +6,8 @@ pub enum Source {
     ITunes,
     SoundCloud,
     YouTubeMusic,
+    /// A file from the local (downloaded) music library.
+    Local,
 }
 
 #[derive(Debug, Clone)]
@@ -655,6 +657,8 @@ pub async fn get_meta(source: Source, id: &str, extra: Option<&str>) -> Option<Y
         Source::ITunes => "itunes",
         Source::SoundCloud => "soundcloud",
         Source::YandexMusic => "yandex",
+        // Local files carry their own metadata.
+        Source::Local => return None,
     };
     let id = id.to_string();
     let extra = extra.map(|s| s.to_string());

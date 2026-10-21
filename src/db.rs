@@ -3,11 +3,7 @@ use rusqlite::{params, Connection};
 use std::path::PathBuf;
 
 fn db_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-        .join(".config")
-        .join("music-player-tui")
-        .join("liked.db")
+    crate::paths::config_dir().join("liked.db")
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +207,7 @@ impl Database {
                     "yandex" => Source::YandexMusic,
                     "soundcloud" => Source::SoundCloud,
                     "ytmusic" => Source::YouTubeMusic,
+                    "local" => Source::Local,
                     _ => Source::ITunes,
                 };
                 Ok(Track {
@@ -312,6 +309,7 @@ impl Database {
                     "yandex" => Source::YandexMusic,
                     "soundcloud" => Source::SoundCloud,
                     "ytmusic" => Source::YouTubeMusic,
+                    "local" => Source::Local,
                     _ => Source::ITunes,
                 };
                 Ok(Track {
@@ -476,6 +474,7 @@ impl Database {
                     "yandex" => Source::YandexMusic,
                     "soundcloud" => Source::SoundCloud,
                     "ytmusic" => Source::YouTubeMusic,
+                    "local" => Source::Local,
                     _ => Source::ITunes,
                 },
                 track_id: row.get(1)?,
@@ -514,6 +513,7 @@ pub fn source_key(source: &Source) -> &'static str {
         Source::ITunes => "itunes",
         Source::SoundCloud => "soundcloud",
         Source::YouTubeMusic => "ytmusic",
+        Source::Local => "local",
     }
 }
 
@@ -567,6 +567,55 @@ mod tests {
         assert_eq!(db.get_playlist_tracks(id).expect("count").len(), 0);
         db.delete_playlist(id).expect("delete");
         assert!(!db.get_playlists().expect("list").iter().any(|p| p.id == id));
+    }
+
+    #[test]
+    fn local_tracks_can_be_liked_and_added_to_playlist() {
+        let db = temp_db("local");
+        let path = format!("/tmp/opencode/__local_{}.mp3", std::process::id());
+        let track = Track {
+            id: path.clone(),
+            title: "Local Song".to_string(),
+            artist: "Local Artist".to_string(),
+            source: Source::Local,
+            preview_url: Some(path.clone()),
+            artwork_url: None,
+            duration_ms: Some(123_000),
+            album: Some("Local Album".to_string()),
+            year: Some(2024),
+        };
+
+        db.like_track(&track).expect("like local");
+        assert!(db.is_liked(&Source::Local, &path).expect("is liked"));
+        let liked = db.get_liked().expect("liked list");
+        let found = liked.iter().find(|t| t.id == path).expect("local track");
+        assert_eq!(
+            found.source,
+            Source::Local,
+            "source must survive the round trip"
+        );
+        assert_eq!(found.duration_ms, Some(123_000));
+
+        let pl_id = db
+            .create_playlist(&format!("__local_pl_{}", std::process::id()))
+            .expect("playlist");
+        db.add_to_playlist(pl_id, &track).expect("add local");
+        let pl_tracks = db.get_playlist_tracks(pl_id).expect("playlist tracks");
+        assert_eq!(pl_tracks.len(), 1);
+        assert_eq!(pl_tracks[0].source, Source::Local);
+        assert_eq!(pl_tracks[0].preview_url.as_deref(), Some(path.as_str()));
+
+        // Stats work for local tracks as well.
+        db.record_play_start(&Source::Local, &path, "Local Song", "Local Artist")
+            .expect("play");
+        db.record_listened(&Source::Local, &path, 5_000)
+            .expect("listen");
+        let counts = db.play_counts().expect("counts");
+        assert_eq!(counts.get(&("local".to_string(), path.clone())), Some(&1));
+
+        db.unlike_track(&Source::Local, &path).expect("unlike");
+        assert!(!db.is_liked(&Source::Local, &path).expect("is liked"));
+        db.delete_playlist(pl_id).expect("delete");
     }
 
     #[test]

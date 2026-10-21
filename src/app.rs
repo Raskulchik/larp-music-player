@@ -49,6 +49,8 @@ pub enum Command {
     },
     RadioFound(Vec<Track>),
     BluetoothStatus(Option<String>),
+    /// The local music library has been scanned.
+    LocalTracks(Vec<Track>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -71,6 +73,8 @@ pub enum ViewMode {
     Lyrics,
     Playlists,
     Stats,
+    /// Local music library (the downloaded files).
+    Local,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -146,6 +150,8 @@ pub struct App {
     pub stats_scroll: u16,
     /// Cached play counts so the track list does not query per row.
     play_counts: std::collections::HashMap<(String, String), u32>,
+    /// The full local library; `tracks` holds the filtered view of it.
+    pub local_library: Vec<Track>,
     cmd_tx: mpsc::UnboundedSender<Command>,
 }
 
@@ -231,6 +237,7 @@ impl App {
             stats_top_by: crate::db::TopBy::Plays,
             stats_scroll: 0,
             play_counts: std::collections::HashMap::new(),
+            local_library: Vec::new(),
             cmd_tx,
         }
     }
@@ -644,7 +651,10 @@ impl App {
                 Ok(false) => {
                     let _ = self.db.like_track(&track);
                     self.status_message = format!("Liked: {}", track.title);
-                    let _ = self.cmd_tx.send(Command::DownloadLikedTrack(track.clone()));
+                    // Local files are already on disk — nothing to download.
+                    if track.source != Source::Local {
+                        let _ = self.cmd_tx.send(Command::DownloadLikedTrack(track.clone()));
+                    }
                 }
                 Err(e) => {
                     self.status_message = format!("Like error: {}", e);
@@ -665,6 +675,7 @@ impl App {
             Source::ITunes => 1,
             Source::SoundCloud => 2,
             Source::YouTubeMusic => 3,
+            Source::Local => 4,
         };
         self.input_mode = InputMode::SourceSelect;
     }
@@ -676,6 +687,7 @@ impl App {
             ViewMode::Lyrics => 2,
             ViewMode::Playlists => 3,
             ViewMode::Stats => 4,
+            ViewMode::Local => 5,
         };
         self.input_mode = InputMode::ViewSelect;
     }
@@ -683,10 +695,10 @@ impl App {
     pub fn select_up(&mut self) {
         match self.input_mode {
             InputMode::SourceSelect => {
-                self.select_index = (self.select_index + 3) % 4;
+                self.select_index = (self.select_index + 4) % 5;
             }
             InputMode::ViewSelect => {
-                self.select_index = (self.select_index + 4) % 5;
+                self.select_index = (self.select_index + 5) % 6;
             }
             InputMode::PlaylistSelect => {
                 if self.playlists.len() > 0 {
@@ -701,10 +713,10 @@ impl App {
     pub fn select_down(&mut self) {
         match self.input_mode {
             InputMode::SourceSelect => {
-                self.select_index = (self.select_index + 1) % 4;
+                self.select_index = (self.select_index + 1) % 5;
             }
             InputMode::ViewSelect => {
-                self.select_index = (self.select_index + 1) % 5;
+                self.select_index = (self.select_index + 1) % 6;
             }
             InputMode::PlaylistSelect => {
                 if !self.playlists.is_empty() {
@@ -720,7 +732,8 @@ impl App {
             0 => Source::YandexMusic,
             1 => Source::ITunes,
             2 => Source::SoundCloud,
-            _ => Source::YouTubeMusic,
+            3 => Source::YouTubeMusic,
+            _ => Source::Local,
         };
         if source == self.current_source {
             self.input_mode = InputMode::Normal;
@@ -756,6 +769,12 @@ impl App {
                 self.input_mode = InputMode::Search;
                 self.status_message = "Switched to YouTube Music".to_string();
             }
+            Source::Local => {
+                // Local files are not fetched over the network: open the
+                // library view and let the user filter it with /.
+                self.input_mode = InputMode::Normal;
+                self.start_local_scan();
+            }
         }
     }
 
@@ -765,7 +784,8 @@ impl App {
             1 => ViewMode::Liked,
             2 => ViewMode::Lyrics,
             3 => ViewMode::Playlists,
-            _ => ViewMode::Stats,
+            4 => ViewMode::Stats,
+            _ => ViewMode::Local,
         };
         self.input_mode = InputMode::Normal;
         match view {
@@ -789,7 +809,48 @@ impl App {
                 self.stats_scroll = 0;
                 self.status_message = "Listening stats — m to switch ranking".to_string();
             }
+            ViewMode::Local => {
+                self.view_mode = ViewMode::Local;
+                self.start_local_scan();
+            }
         }
+    }
+
+    /// Scan the local music folder in the background and show the result.
+    pub fn start_local_scan(&mut self) {
+        let dir = crate::paths::downloads_dir();
+        self.loading = true;
+        self.status_message = format!("Scanning {}…", dir.display());
+        let tx = self.cmd_tx.clone();
+        std::thread::spawn(move || {
+            let tracks = crate::local::scan_dir(&dir);
+            let _ = tx.send(Command::LocalTracks(tracks));
+        });
+    }
+
+    /// Filter the already scanned local library by a query.
+    /// An empty query restores the full library.
+    pub fn filter_local(&mut self, query: &str) {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            self.current_index = 0;
+            self.tracks = self.local_library.clone();
+            self.status_message = format!("Local library: {} tracks", self.tracks.len());
+            return;
+        }
+        let matched: Vec<Track> = self
+            .local_library
+            .iter()
+            .filter(|t| {
+                t.title.to_lowercase().contains(&q)
+                    || t.artist.to_lowercase().contains(&q)
+                    || t.id.to_lowercase().contains(&q)
+            })
+            .cloned()
+            .collect();
+        self.current_index = 0;
+        self.status_message = format!("{} local tracks match \"{}\"", matched.len(), query);
+        self.tracks = matched;
     }
 
     pub fn load_liked(&mut self) {
@@ -1024,10 +1085,17 @@ impl App {
             }
             InputMode::Search => {
                 let q = self.search_query.clone();
-                self.submit_search();
-                if !q.is_empty() {
+                if self.current_source == Source::Local {
+                    // Local files are filtered in place, no network involved.
+                    self.filter_local(&q);
                     self.input_mode = InputMode::Normal;
                     self.search_query.clear();
+                } else {
+                    self.submit_search();
+                    if !q.is_empty() {
+                        self.input_mode = InputMode::Normal;
+                        self.search_query.clear();
+                    }
                 }
             }
             InputMode::SourceSelect => self.confirm_source_select(),
@@ -1073,6 +1141,17 @@ impl App {
     }
 
     pub fn focus_search(&mut self) {
+        if self.current_source == Source::Local {
+            // Filter the local library instead of searching the network.
+            if self.view_mode != ViewMode::Local {
+                self.view_mode = ViewMode::Local;
+                self.start_local_scan();
+                return;
+            }
+            self.input_mode = InputMode::Search;
+            self.status_message = "Filter local tracks…".to_string();
+            return;
+        }
         self.view_mode = ViewMode::Search;
         match self.current_source {
             Source::YandexMusic => {
@@ -1090,6 +1169,9 @@ impl App {
                 self.input_mode = InputMode::Search;
             }
             Source::YouTubeMusic => {
+                self.input_mode = InputMode::Search;
+            }
+            Source::Local => {
                 self.input_mode = InputMode::Search;
             }
         }
@@ -1110,6 +1192,8 @@ impl App {
                 Source::ITunes => api::search_itunes(&query).await,
                 Source::SoundCloud => api::search_soundcloud(&query).await,
                 Source::YouTubeMusic => api::search_ytmusic(&query).await,
+                // Handled locally in `submit`.
+                Source::Local => Ok(Vec::new()),
             };
 
             match result {
@@ -1129,6 +1213,8 @@ impl App {
             Source::SoundCloud => (t.preview_url.clone().unwrap_or_default(), t.source),
             Source::YandexMusic => (t.id.clone(), t.source),
             Source::YouTubeMusic => (t.id.clone(), t.source),
+            // The id of a local track is the absolute file path.
+            Source::Local => (t.id.clone(), t.source),
         })
     }
 
@@ -1280,6 +1366,30 @@ impl App {
                     format!("Radio: {} similar tracks appended", count)
                 } else {
                     "Radio: no similar tracks found".to_string()
+                };
+            }
+            Command::LocalTracks(tracks) => {
+                let count = tracks.len();
+                self.loading = false;
+                self.view_mode = ViewMode::Local;
+                self.local_library = tracks;
+                self.tracks = self.local_library.clone();
+                self.current_index = 0;
+                self.playing_track_id = None;
+                self.playing_track = None;
+                self.radio_active = false;
+                self.refresh_play_counts();
+                self.status_message = if count > 0 {
+                    format!(
+                        "Local library: {} tracks in {}",
+                        count,
+                        crate::paths::downloads_dir().display()
+                    )
+                } else {
+                    format!(
+                        "No downloaded music yet in {}",
+                        crate::paths::downloads_dir().display()
+                    )
                 };
             }
             Command::MetaUpdated {

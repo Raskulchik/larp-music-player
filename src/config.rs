@@ -27,8 +27,7 @@ pub fn now_secs() -> u64 {
 }
 
 fn config_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".config").join("music-player-tui")
+    crate::paths::config_dir()
 }
 
 fn config_file() -> PathBuf {

@@ -10,7 +10,11 @@ use tokio::sync::mpsc;
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 pub enum PlayerCommand {
-    PlayFile(String, f32, u64),
+    /// `path_or_url`, volume, generation, keep a decoded PCM copy in the cache.
+    ///
+    /// Files that already live on disk are decoded on the fly: caching them
+    /// would only duplicate the audio.
+    PlayFile(String, f32, u64, bool),
     Pause,
     Resume,
     Stop,
@@ -19,9 +23,9 @@ pub enum PlayerCommand {
     Seek(f64),
 }
 
+/// Where decoded audio and downloads are kept (`~/.local/share/music-player-tui`).
 fn cache_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".cache").join("music-player-tui")
+    crate::paths::data_dir()
 }
 
 fn cache_path(key: &str) -> PathBuf {
@@ -60,7 +64,7 @@ pub fn start(
         loop {
             match rx.try_recv() {
                 Ok(cmd) => match cmd {
-                    PlayerCommand::PlayFile(url_or_path, volume, generation) => {
+                    PlayerCommand::PlayFile(url_or_path, volume, generation, cache_pcm) => {
                         if is_stale(generation) {
                             dlog!("[player] stale PlayFile (gen {}), discarding", generation);
                             continue;
@@ -70,8 +74,12 @@ pub fn start(
 
                         let pcm_key = &url_or_path;
                         let cached = cache_path(pcm_key);
+                        // Files that are already on disk are decoded on the
+                        // fly instead of keeping a second PCM copy.
+                        let local = !cache_pcm;
 
-                        let pcm_data = if cached.exists()
+                        let pcm_data = if !local
+                            && cached.exists()
                             && std::fs::metadata(&cached)
                                 .map(|m| m.len() > 0)
                                 .unwrap_or(false)
@@ -89,7 +97,9 @@ pub fn start(
                                 Ok(samples) if !samples.is_empty() => {
                                     dlog!("[player] decoded {} samples from HLS", samples.len());
                                     let pcm = samples_to_bytes(&samples);
-                                    let _ = std::fs::write(&cached, &pcm);
+                                    if !local {
+                                        let _ = std::fs::write(&cached, &pcm);
+                                    }
                                     Some(pcm)
                                 }
                                 _ => {
@@ -139,7 +149,9 @@ pub fn start(
                                         samples.len() / 88
                                     );
                                     let pcm = samples_to_bytes(&samples);
-                                    let _ = std::fs::write(&cached, &pcm);
+                                    if !local {
+                                        let _ = std::fs::write(&cached, &pcm);
+                                    }
                                     Some(pcm)
                                 }
                                 _ => {

@@ -3,8 +3,10 @@ mod app;
 mod config;
 mod db;
 mod discord_rpc;
+mod local;
 mod log;
 mod mpris;
+mod paths;
 mod player;
 mod tags;
 mod ui;
@@ -31,6 +33,7 @@ fn discord_set(discord: &Option<discord_rpc::DiscordRpc>, app: &App) {
                 api::Source::SoundCloud => "SoundCloud",
                 api::Source::ITunes => "iTunes",
                 api::Source::YouTubeMusic => "YouTube Music",
+                api::Source::Local => "Local file",
             };
             d.set_activity(
                 &track.title,
@@ -71,11 +74,7 @@ fn discord_resume(discord: &Option<discord_rpc::DiscordRpc>, app: &App) {
 }
 
 fn downloads_dir() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home)
-        .join(".cache")
-        .join("music-player-tui")
-        .join("downloads")
+    paths::downloads_dir()
 }
 
 fn sanitize_filename(s: &str) -> String {
@@ -153,6 +152,10 @@ fn check_bluetooth_device() -> Option<String> {
 
 fn local_liked_path(app: &App) -> Option<std::path::PathBuf> {
     let track = app.current_track()?;
+    // Local tracks are played straight from disk.
+    if track.source == api::Source::Local {
+        return None;
+    }
     if !app.db.is_liked(&track.source, &track.id).unwrap_or(false) {
         return None;
     }
@@ -211,6 +214,11 @@ fn start_download_liked(app: &App, cmd_tx: &mpsc::UnboundedSender<app::Command>,
                     total,
                 });
             }
+            if track.source == api::Source::Local {
+                // Already a file on disk — nothing to fetch.
+                downloaded += 1;
+                continue;
+            }
             let filename = sanitize_filename(&format!("{} - {}.mp3", track.artist, track.title));
             let dest = downloads_dir().join(&filename);
             if dest.exists() {
@@ -228,6 +236,7 @@ fn start_download_liked(app: &App, cmd_tx: &mpsc::UnboundedSender<app::Command>,
                 api::Source::SoundCloud => download_soundcloud(&track.id, &dest).await,
                 api::Source::YouTubeMusic => download_ytmusic(&track.id, &dest).await,
                 api::Source::YandexMusic => download_yandex(&track.id, &token, &dest).await,
+                api::Source::Local => Ok(()),
             };
             match result {
                 Ok(()) => {
@@ -276,6 +285,7 @@ fn artwork_is_big(source: api::Source, url: Option<&str>) -> bool {
         api::Source::ITunes => u.contains("600x600bb"),
         api::Source::SoundCloud => u.contains("t500x500"),
         api::Source::YandexMusic => u.contains("1000x1000"),
+        api::Source::Local => false,
     }
 }
 
@@ -449,6 +459,8 @@ fn start_radio(app: &App, cmd_tx: &mpsc::UnboundedSender<app::Command>, api_key:
                 api::Source::ITunes => api::search_itunes(&query).await,
                 api::Source::SoundCloud => api::search_soundcloud(&query).await,
                 api::Source::YouTubeMusic => api::search_ytmusic(&query).await,
+                // Radio looks for online versions of the track.
+                api::Source::Local => api::search_itunes(&query).await,
             };
             if let Ok(tracks) = result {
                 if let Some(t) = tracks.into_iter().next() {
@@ -505,6 +517,8 @@ fn play_track(
             path.to_string_lossy().into_owned(),
             app.volume,
             gen,
+            // The file is already on disk — no PCM copy needed.
+            false,
         ));
         if let Some(t) = app.current_track() {
             let _ = cmd_tx.send(app::Command::Status(format!(
@@ -518,7 +532,9 @@ fn play_track(
         let gen = player::next_generation();
         match source {
             api::Source::ITunes => {
-                let _ = player_tx.send(player::PlayerCommand::PlayFile(id_or_url, app.volume, gen));
+                let _ = player_tx.send(player::PlayerCommand::PlayFile(
+                    id_or_url, app.volume, gen, true,
+                ));
             }
             api::Source::SoundCloud => {
                 let tx = player_tx.clone();
@@ -554,8 +570,9 @@ fn play_track(
                         Ok(Ok(output)) => {
                             let _ = cmd_tx2.send(app::Command::DownloadProgress(100));
                             if output.status.success() {
-                                let _ =
-                                    tx.send(player::PlayerCommand::PlayFile(tmp_path, vol, gen));
+                                let _ = tx.send(player::PlayerCommand::PlayFile(
+                                    tmp_path, vol, gen, true,
+                                ));
                             } else {
                                 let stderr = String::from_utf8_lossy(&output.stderr);
                                 let msg = if stderr.contains("DRM protected") {
@@ -587,7 +604,7 @@ fn play_track(
                 tokio::spawn(async move {
                     match api::get_yandex_download_url(&id_or_url, &token).await {
                         Ok(url) => {
-                            let _ = tx.send(player::PlayerCommand::PlayFile(url, vol, gen));
+                            let _ = tx.send(player::PlayerCommand::PlayFile(url, vol, gen, true));
                         }
                         Err(e) => {
                             let _ = cmd_tx2.send(app::Command::PlayError(e.to_string()));
@@ -629,8 +646,9 @@ fn play_track(
                         Ok(Ok(output)) => {
                             let _ = cmd_tx2.send(app::Command::DownloadProgress(100));
                             if output.status.success() {
-                                let _ =
-                                    tx.send(player::PlayerCommand::PlayFile(tmp_path, vol, gen));
+                                let _ = tx.send(player::PlayerCommand::PlayFile(
+                                    tmp_path, vol, gen, true,
+                                ));
                             } else {
                                 let stderr = String::from_utf8_lossy(&output.stderr);
                                 dlog!("ytmusic yt-dlp failed: {}", stderr.trim());
@@ -660,6 +678,24 @@ fn play_track(
                         }
                     }
                 });
+            }
+            api::Source::Local => {
+                // A file from the local music library: play it straight from
+                // disk, no download and no PCM cache.
+                let path = std::path::PathBuf::from(&id_or_url);
+                if !path.is_file() {
+                    let _ = cmd_tx.send(app::Command::PlayError(format!(
+                        "File not found: {}",
+                        path.display()
+                    )));
+                    return;
+                }
+                let gen = player::next_generation();
+                let _ = player_tx.send(player::PlayerCommand::PlayFile(
+                    id_or_url, app.volume, gen,
+                    // The file is already on disk — no PCM copy needed.
+                    false,
+                ));
             }
         }
     }
@@ -691,6 +727,18 @@ async fn main() -> anyhow::Result<()> {
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+
+    // One-off relocation of the old ~/.cache/music-player-tui tree into
+    // ~/.local/share/music-player-tui.
+    let migration = paths::migrate_legacy_cache();
+    if migration.moved > 0 || migration.skipped > 0 {
+        dlog!(
+            "[paths] cache migration: moved {} files, skipped {}",
+            migration.moved,
+            migration.skipped
+        );
+    }
+    let _ = std::fs::create_dir_all(paths::data_dir());
 
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<app::Command>();
 
@@ -1437,6 +1485,8 @@ async fn main() -> anyhow::Result<()> {
                             api::Source::YandexMusic => {
                                 download_yandex(&track.id, &token, &dest).await
                             }
+                            // Local files are already on disk.
+                            api::Source::Local => Ok(()),
                         }
                     };
                     let _ = tx.send(app::Command::DownloadLikedTrackDone {

@@ -59,6 +59,7 @@ fn draw_source_select(f: &mut Frame, app: &App) {
         ("iTunes", Source::ITunes),
         ("SoundCloud", Source::SoundCloud),
         ("YouTube Music", Source::YouTubeMusic),
+        ("Local files", Source::Local),
     ];
     let items: Vec<Line> = sources
         .iter()
@@ -87,6 +88,7 @@ fn draw_view_select(f: &mut Frame, app: &App) {
         ("Lyrics", ViewMode::Lyrics),
         ("Playlists", ViewMode::Playlists),
         ("Stats", ViewMode::Stats),
+        ("Local", ViewMode::Local),
     ];
     let items: Vec<Line> = views
         .iter()
@@ -145,7 +147,7 @@ fn draw_help(f: &mut Frame, _app: &App) {
         ("Shift+N", "new playlist"),
         ("Shift+D", "delete playlist / remove from playlist"),
         ("   /", "search"),
-        ("Tab", "views (search/liked/lyrics/playlists)"),
+        ("Tab", "views (search/liked/lyrics/playlists/stats/local)"),
         (" t", "source"),
         (" L", "like"),
         (" r", "repeat"),
@@ -227,6 +229,7 @@ fn source_label(source: &Source) -> &'static str {
         Source::ITunes => "iT",
         Source::SoundCloud => "SC",
         Source::YouTubeMusic => "YT",
+        Source::Local => "LOC",
     }
 }
 
@@ -239,6 +242,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         ViewMode::Lyrics => "lyrics",
         ViewMode::Playlists => "playlists",
         ViewMode::Stats => "stats",
+        ViewMode::Local => "local",
     };
 
     let hint = "Shift+H help";
@@ -434,6 +438,13 @@ fn draw_tracklist(f: &mut Frame, app: &mut App, area: Rect) {
             ViewMode::Search => "  no tracks — press / to search",
             ViewMode::Liked => "  no liked songs — press L to like",
             ViewMode::Playlists => "  empty playlist — Shift+A to add tracks",
+            ViewMode::Local => {
+                if app.local_library.is_empty() {
+                    "  no downloaded music yet — press D in Liked to download"
+                } else {
+                    "  no tracks match the filter"
+                }
+            }
             ViewMode::Lyrics | ViewMode::Stats => "",
         };
         let empty = Paragraph::new(msg).style(Style::default().fg(Color::DarkGray));
@@ -450,6 +461,7 @@ fn draw_tracklist(f: &mut Frame, app: &mut App, area: Rect) {
             .unwrap_or_else(|| "playlist".into()),
         ViewMode::Lyrics => "lyrics".into(),
         ViewMode::Stats => "stats".into(),
+        ViewMode::Local => "local".into(),
     };
 
     let playing_id = if app.is_playing {
