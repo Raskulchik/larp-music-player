@@ -33,6 +33,60 @@ fn cache_path(key: &str) -> PathBuf {
     cache_dir().join(format!("{}.pcm", hash))
 }
 
+/// Upper bound for the decoded-PCM cache. The oldest entries are dropped
+/// first, so the cache cannot fill up the disk.
+const PCM_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The limit in use, overridable with `LARP_PCM_CACHE_MAX_MB`.
+fn pcm_cache_max_bytes() -> u64 {
+    if let Ok(v) = std::env::var("LARP_PCM_CACHE_MAX_MB") {
+        if let Ok(mb) = v.parse::<u64>() {
+            return mb * 1024 * 1024;
+        }
+    }
+    PCM_CACHE_MAX_BYTES
+}
+
+/// Remove the oldest cached PCM files until the cache fits into `max_bytes`.
+fn prune_pcm_cache_in(dir: &std::path::Path, max_bytes: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total: u64 = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("pcm") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let len = meta.len();
+        total += len;
+        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        files.push((mtime, len, path));
+    }
+    if total <= max_bytes {
+        return;
+    }
+    files.sort_by_key(|(mtime, _, _)| *mtime);
+    let mut excess = total - max_bytes;
+    for (_, len, path) in files {
+        if excess == 0 {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            excess = excess.saturating_sub(len);
+        }
+    }
+}
+
+/// Keep the PCM cache under its limit.
+pub fn prune_pcm_cache() {
+    prune_pcm_cache_in(&cache_dir(), pcm_cache_max_bytes());
+}
+
 pub fn next_generation() -> u64 {
     GENERATION.fetch_add(1, Ordering::SeqCst) + 1
 }
@@ -56,6 +110,8 @@ pub fn start(
         let sink = Arc::new(sink);
 
         let _ = std::fs::create_dir_all(cache_dir());
+        // Drop leftovers that exceed the cache limit (e.g. from older versions).
+        prune_pcm_cache();
 
         let mut playing = false;
         let mut current_samples: Option<Vec<i16>> = None;
@@ -99,6 +155,7 @@ pub fn start(
                                     let pcm = samples_to_bytes(&samples);
                                     if !local {
                                         let _ = std::fs::write(&cached, &pcm);
+                                        prune_pcm_cache();
                                     }
                                     Some(pcm)
                                 }
@@ -151,6 +208,7 @@ pub fn start(
                                     let pcm = samples_to_bytes(&samples);
                                     if !local {
                                         let _ = std::fs::write(&cached, &pcm);
+                                        prune_pcm_cache();
                                     }
                                     Some(pcm)
                                 }
@@ -355,4 +413,66 @@ fn decode_with_ffmpeg_url(url: &str) -> anyhow::Result<Vec<i16>> {
         .collect();
 
     Ok(samples)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prune_pcm_cache_in;
+    use std::path::PathBuf;
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "larp_pcm_{}_{}_{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn prune_keeps_cache_within_the_limit() {
+        let dir = tmp_dir("prune");
+        // Three files of 1 KiB each, written oldest first.
+        for i in 0..3u64 {
+            let path = dir.join(format!("{}.pcm", i));
+            std::fs::write(&path, vec![0u8; 1024]).unwrap();
+            // Make the order of the files unambiguous.
+            let time = std::time::SystemTime::now() - std::time::Duration::from_secs(100 - i);
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(time))
+                .unwrap();
+        }
+        std::fs::write(dir.join("keep.txt"), b"x").unwrap();
+
+        prune_pcm_cache_in(&dir, 2048);
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.contains(&"keep.txt".to_string()), "other files stay");
+        let pcm_left = left.iter().filter(|n| n.ends_with(".pcm")).count();
+        assert!(
+            pcm_left <= 2,
+            "cache must shrink to the limit, left {}",
+            pcm_left
+        );
+        // The newest file must survive, the oldest must go.
+        assert!(left.contains(&"2.pcm".to_string()));
+        assert!(!left.contains(&"0.pcm".to_string()));
+    }
+
+    #[test]
+    fn prune_keeps_everything_below_the_limit() {
+        let dir = tmp_dir("prune_small");
+        std::fs::write(dir.join("a.pcm"), vec![0u8; 100]).unwrap();
+        prune_pcm_cache_in(&dir, 10_000);
+        assert!(dir.join("a.pcm").exists(), "small cache is untouched");
+    }
 }
