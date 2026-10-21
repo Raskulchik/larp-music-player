@@ -1,2 +1,5 @@
 /target
 /.venv
+/dist
+/larp-music-player-linux-x86_64.tar.gz
+/larp-music-player-linux-x86_64.tar.gz.sha256
