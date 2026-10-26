@@ -159,6 +159,7 @@ fn draw_help(f: &mut Frame, _app: &App) {
         ("Esc", "back / close"),
         ("m", "stats: switch ranking"),
         (" u", "check for updates"),
+        ("  CLI", "larp-music-player --help"),
     ]
     .iter()
     .map(|(k, desc)| {

@@ -51,6 +51,12 @@ pub enum Command {
     BluetoothStatus(Option<String>),
     /// The local music library has been scanned.
     LocalTracks(Vec<Track>),
+    /// A request from CLI mode. The main loop performs the action and answers
+    /// through `reply`.
+    Cli {
+        request: crate::cli::CliRequest,
+        reply: tokio::sync::oneshot::Sender<crate::cli::CliResponse>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,6 +158,8 @@ pub struct App {
     play_counts: std::collections::HashMap<(String, String), u32>,
     /// The full local library; `tracks` holds the filtered view of it.
     pub local_library: Vec<Track>,
+    /// Play the first result of the next search (used by `play` in CLI mode).
+    pending_autoplay: bool,
     cmd_tx: mpsc::UnboundedSender<Command>,
 }
 
@@ -238,6 +246,7 @@ impl App {
             stats_scroll: 0,
             play_counts: std::collections::HashMap::new(),
             local_library: Vec::new(),
+            pending_autoplay: false,
             cmd_tx,
         }
     }
@@ -1177,7 +1186,17 @@ impl App {
         }
     }
 
-    fn submit_search(&self) {
+    /// Ask the main loop to start the first result of the next search.
+    pub fn request_autoplay(&mut self) {
+        self.pending_autoplay = true;
+    }
+
+    /// Consume the autoplay request (called after search results arrive).
+    pub fn take_pending_autoplay(&mut self) -> bool {
+        std::mem::take(&mut self.pending_autoplay)
+    }
+
+    pub(crate) fn submit_search(&self) {
         if self.search_query.is_empty() {
             return;
         }
@@ -1237,6 +1256,7 @@ impl App {
             }
             Command::SearchError(e) => {
                 self.loading = false;
+                self.pending_autoplay = false;
                 self.status_message = format!("Error: {}", e);
                 if self.current_source == Source::SoundCloud && self.sc_client_id.is_empty() {
                     self.input_mode = InputMode::ClientIdInput;
@@ -1425,6 +1445,8 @@ impl App {
                 self.status_message =
                     format!("Update {} available — press U to open release page", tag);
             }
+            // Handled by the main loop before it reaches App.
+            Command::Cli { .. } => {}
         }
     }
 

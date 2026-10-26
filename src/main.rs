@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod cli;
 mod config;
 mod db;
 mod discord_rpc;
@@ -701,8 +702,544 @@ fn play_track(
     }
 }
 
+/// Start the currently selected track, updating MPRIS/Discord as the TUI does.
+async fn cli_start_track(
+    app: &App,
+    player_tx: &mpsc::UnboundedSender<player::PlayerCommand>,
+    cmd_tx: &mpsc::UnboundedSender<app::Command>,
+    mpris: &Option<mpris::MprisServer>,
+    discord: &Option<discord_rpc::DiscordRpc>,
+) {
+    if let Some(ref m) = mpris {
+        if let Some(t) = app.current_track() {
+            m.update_track(t).await;
+        }
+        m.set_playing(true).await;
+    }
+    discord_set(discord, app);
+    play_track(player_tx, app, cmd_tx);
+}
+
+async fn handle_cli_request(
+    request: cli::CliRequest,
+    app: &mut App,
+    player_tx: &mpsc::UnboundedSender<player::PlayerCommand>,
+    cmd_tx: &mpsc::UnboundedSender<app::Command>,
+    mpris: &Option<mpris::MprisServer>,
+    discord: &Option<discord_rpc::DiscordRpc>,
+) -> (cli::CliResponse, bool) {
+    let command = request.command.to_ascii_lowercase();
+    let args = request.args;
+    let source_arg = request.source;
+    let limit = request.limit;
+
+    match command.as_str() {
+        "status" => {
+            let (message, data) = cli::status_message_and_data(app);
+            (cli::CliResponse::ok_data(message, data), false)
+        }
+        "play" => {
+            let target = args.join(" ");
+            let target = target.trim();
+            if target.is_empty() {
+                return (
+                    cli::CliResponse::err("play needs a search query or a file path"),
+                    false,
+                );
+            }
+            let requested_source = match source_arg.as_deref() {
+                Some(value) => match cli::parse_source(value) {
+                    Some(source) => Some(source),
+                    None => {
+                        return (
+                            cli::CliResponse::err(format!(
+                                "unknown source '{value}' (try yandex, itunes, soundcloud, ytmusic, local)"
+                            )),
+                            false,
+                        )
+                    }
+                },
+                None => None,
+            };
+
+            let path = cli::expand_path(target);
+            if path.is_file() {
+                let Some(track) = local::track_for(&path) else {
+                    return (
+                        cli::CliResponse::err(format!(
+                            "cannot read audio metadata from {}",
+                            path.display()
+                        )),
+                        false,
+                    );
+                };
+                let title = format!("{} — {}", track.artist, track.title);
+                app.flush_stats();
+                app.tracks.push(track);
+                app.current_index = app.tracks.len() - 1;
+                app.is_playing = true;
+                app.loading_play = true;
+                app.note_playing();
+                cli_start_track(app, player_tx, cmd_tx, mpris, discord).await;
+                return (cli::CliResponse::ok(format!("Playing: {title}")), false);
+            }
+
+            let source = requested_source.unwrap_or(app.current_source);
+            if source == api::Source::Local {
+                let mut library = if app.local_library.is_empty() {
+                    local::scan_dir(&paths::downloads_dir())
+                } else {
+                    app.local_library.clone()
+                };
+                let needle = target.to_lowercase();
+                library.retain(|track| {
+                    track.title.to_lowercase().contains(&needle)
+                        || track.artist.to_lowercase().contains(&needle)
+                        || track.id.to_lowercase().contains(&needle)
+                });
+                if library.is_empty() {
+                    return (
+                        cli::CliResponse::err(format!("no local track matches '{target}'")),
+                        false,
+                    );
+                }
+                let count = library.len();
+                let first = format!("{} — {}", library[0].artist, library[0].title);
+                app.tracks = library;
+                app.current_index = 0;
+                app.view_mode = app::ViewMode::Local;
+                app.is_playing = true;
+                app.loading_play = true;
+                app.note_playing();
+                cli_start_track(app, player_tx, cmd_tx, mpris, discord).await;
+                let suffix = if count > 1 {
+                    format!(" ({count} matches in the queue)")
+                } else {
+                    String::new()
+                };
+                return (
+                    cli::CliResponse::ok(format!("Playing local: {first}{suffix}")),
+                    false,
+                );
+            }
+
+            if source == api::Source::YandexMusic && app.token.is_empty() {
+                return (
+                    cli::CliResponse::err(
+                        "Yandex Music needs a token in ~/.config/music-player-tui/config.json",
+                    ),
+                    false,
+                );
+            }
+            app.current_source = source;
+            app.view_mode = app::ViewMode::Search;
+            app.search_query = target.to_string();
+            app.loading = true;
+            app.request_autoplay();
+            app.submit_search();
+            (
+                cli::CliResponse::ok(format!(
+                    "Searching {} for '{target}' — the first match will play",
+                    cli::source_name(source)
+                )),
+                false,
+            )
+        }
+        "pause" => {
+            if !app.is_playing {
+                return (cli::CliResponse::ok("Already paused"), false);
+            }
+            let _ = player_tx.send(player::PlayerCommand::Pause);
+            app.pause();
+            if let Some(ref m) = mpris {
+                m.set_playing(false).await;
+            }
+            discord_state(discord, "Paused", None, false);
+            (cli::CliResponse::ok("Paused"), false)
+        }
+        "resume" => {
+            if app.is_playing {
+                return (cli::CliResponse::ok("Already playing"), false);
+            }
+            if app.current_track().is_none() {
+                return (cli::CliResponse::err("nothing is queued"), false);
+            }
+            let same_track =
+                app.playing_track_id.is_some() && app.playing_track_id == app.current_track_id();
+            if same_track {
+                let _ = player_tx.send(player::PlayerCommand::Resume);
+                app.resume();
+                if let Some(ref m) = mpris {
+                    m.set_playing(true).await;
+                }
+                discord_resume(discord, app);
+                (cli::CliResponse::ok("Resumed"), false)
+            } else {
+                app.is_playing = true;
+                app.loading_play = true;
+                app.note_playing();
+                cli_start_track(app, player_tx, cmd_tx, mpris, discord).await;
+                (cli::CliResponse::ok("Playing"), false)
+            }
+        }
+        "toggle" => match app.toggle_play() {
+            PlayAction::Pause => {
+                let _ = player_tx.send(player::PlayerCommand::Pause);
+                if let Some(ref m) = mpris {
+                    m.set_playing(false).await;
+                }
+                discord_state(discord, "Paused", None, false);
+                (cli::CliResponse::ok("Paused"), false)
+            }
+            PlayAction::Resume => {
+                let _ = player_tx.send(player::PlayerCommand::Resume);
+                if let Some(ref m) = mpris {
+                    m.set_playing(true).await;
+                }
+                discord_resume(discord, app);
+                (cli::CliResponse::ok("Resumed"), false)
+            }
+            PlayAction::NewTrack => {
+                cli_start_track(app, player_tx, cmd_tx, mpris, discord).await;
+                (cli::CliResponse::ok("Playing"), false)
+            }
+        },
+        "next" => {
+            if app.next_track() {
+                let title = app
+                    .current_track()
+                    .map(|t| format!("{} — {}", t.artist, t.title))
+                    .unwrap_or_default();
+                cli_start_track(app, player_tx, cmd_tx, mpris, discord).await;
+                (cli::CliResponse::ok(format!("Next: {title}")), false)
+            } else {
+                (cli::CliResponse::err("the queue is empty"), false)
+            }
+        }
+        "prev" => {
+            if app.prev_track() {
+                let title = app
+                    .current_track()
+                    .map(|t| format!("{} — {}", t.artist, t.title))
+                    .unwrap_or_default();
+                cli_start_track(app, player_tx, cmd_tx, mpris, discord).await;
+                (cli::CliResponse::ok(format!("Previous: {title}")), false)
+            } else {
+                (cli::CliResponse::err("the queue is empty"), false)
+            }
+        }
+        "stop" => {
+            let _ = player_tx.send(player::PlayerCommand::Stop);
+            app.flush_stats();
+            app.is_playing = false;
+            app.started_at = None;
+            app.paused_at_ms = None;
+            app.playing_track_id = None;
+            app.playing_track = None;
+            app.track_duration_ms = None;
+            app.loading_play = false;
+            app.status_message = "Stopped".to_string();
+            if let Some(ref m) = mpris {
+                m.set_playing(false).await;
+            }
+            discord_state(discord, "Stopped", None, false);
+            (cli::CliResponse::ok("Stopped"), false)
+        }
+        "volume" => {
+            if args.is_empty() {
+                let volume = (app.volume * 100.0).round() as i32;
+                return (
+                    cli::CliResponse::ok_data(
+                        format!("Volume: {volume}%"),
+                        serde_json::json!({ "volume": volume }),
+                    ),
+                    false,
+                );
+            }
+            let raw = args[0].trim().trim_end_matches('%');
+            let value = match raw.parse::<f32>() {
+                Ok(value) if (0.0..=100.0).contains(&value) => value,
+                _ => {
+                    return (
+                        cli::CliResponse::err("volume expects a percentage from 0 to 100"),
+                        false,
+                    )
+                }
+            };
+            app.set_volume(value / 100.0);
+            let _ = player_tx.send(player::PlayerCommand::SetVolume(app.volume));
+            if let Some(ref m) = mpris {
+                m.set_volume(app.volume).await;
+            }
+            let volume = (app.volume * 100.0).round() as i32;
+            (
+                cli::CliResponse::ok_data(
+                    format!("Volume: {volume}%"),
+                    serde_json::json!({ "volume": volume }),
+                ),
+                false,
+            )
+        }
+        "seek" => {
+            let Some(value) = args.first() else {
+                return (
+                    cli::CliResponse::err("seek needs a position in seconds"),
+                    false,
+                );
+            };
+            let value = value.trim();
+            let relative = value.starts_with('+') || value.starts_with('-');
+            let seconds = match value.parse::<f64>() {
+                Ok(seconds) if seconds.is_finite() => seconds,
+                _ => {
+                    return (
+                        cli::CliResponse::err("seek expects a number of seconds"),
+                        false,
+                    )
+                }
+            };
+            let current = app.position_ms().unwrap_or(0) as f64 / 1000.0;
+            let mut target = if relative { current + seconds } else { seconds };
+            target = target.max(0.0);
+            if let Some(duration) = app
+                .track_duration_ms
+                .or_else(|| app.current_track().and_then(|t| t.duration_ms))
+            {
+                target = target.min(duration as f64 / 1000.0);
+            }
+            let _ = player_tx.send(player::PlayerCommand::Seek(target));
+            app.set_position((target * 1000.0) as u64);
+            if app.is_playing {
+                discord_state(discord, "Playing", app.position_ms(), true);
+            }
+            let position = (target * 1000.0) as u64;
+            (
+                cli::CliResponse::ok_data(
+                    format!("Seek: {}", cli::fmt_duration(position)),
+                    serde_json::json!({ "position_ms": position }),
+                ),
+                false,
+            )
+        }
+        "shuffle" => match args.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("on") | Some("true") | Some("1") | Some("yes") => {
+                app.shuffle = true;
+                app.status_message = "Shuffle: on".to_string();
+                (
+                    cli::CliResponse::ok_data(
+                        "Shuffle: on",
+                        serde_json::json!({ "shuffle": true }),
+                    ),
+                    false,
+                )
+            }
+            Some("off") | Some("false") | Some("0") | Some("no") => {
+                app.shuffle = false;
+                app.status_message = "Shuffle: off".to_string();
+                (
+                    cli::CliResponse::ok_data(
+                        "Shuffle: off",
+                        serde_json::json!({ "shuffle": false }),
+                    ),
+                    false,
+                )
+            }
+            Some("toggle") | None => {
+                if args.is_empty() {
+                    let state = app.shuffle;
+                    (
+                        cli::CliResponse::ok_data(
+                            format!("Shuffle: {}", if state { "on" } else { "off" }),
+                            serde_json::json!({ "shuffle": state }),
+                        ),
+                        false,
+                    )
+                } else {
+                    app.toggle_shuffle();
+                    (
+                        cli::CliResponse::ok_data(
+                            app.status_message.clone(),
+                            serde_json::json!({ "shuffle": app.shuffle }),
+                        ),
+                        false,
+                    )
+                }
+            }
+            Some(other) => (
+                cli::CliResponse::err(format!("shuffle expects on, off or toggle, got '{other}'")),
+                false,
+            ),
+        },
+        "repeat" => match args.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+            None => {
+                let mode = cli::repeat_name(app.repeat_mode);
+                (
+                    cli::CliResponse::ok_data(
+                        format!("Repeat: {mode}"),
+                        serde_json::json!({ "repeat": mode }),
+                    ),
+                    false,
+                )
+            }
+            Some("off") => {
+                app.repeat_mode = app::RepeatMode::Off;
+                app.status_message = "Repeat: off".to_string();
+                (
+                    cli::CliResponse::ok_data(
+                        "Repeat: off",
+                        serde_json::json!({ "repeat": "off" }),
+                    ),
+                    false,
+                )
+            }
+            Some("all") => {
+                app.repeat_mode = app::RepeatMode::All;
+                app.status_message = "Repeat: all".to_string();
+                (
+                    cli::CliResponse::ok_data(
+                        "Repeat: all",
+                        serde_json::json!({ "repeat": "all" }),
+                    ),
+                    false,
+                )
+            }
+            Some("one") => {
+                app.repeat_mode = app::RepeatMode::One;
+                app.status_message = "Repeat: one".to_string();
+                (
+                    cli::CliResponse::ok_data(
+                        "Repeat: one",
+                        serde_json::json!({ "repeat": "one" }),
+                    ),
+                    false,
+                )
+            }
+            Some("toggle") | Some("next") => {
+                app.cycle_repeat();
+                let mode = cli::repeat_name(app.repeat_mode);
+                (
+                    cli::CliResponse::ok_data(
+                        app.status_message.clone(),
+                        serde_json::json!({ "repeat": mode }),
+                    ),
+                    false,
+                )
+            }
+            Some(other) => (
+                cli::CliResponse::err(format!(
+                    "repeat expects off, all, one or toggle, got '{other}'"
+                )),
+                false,
+            ),
+        },
+        "like" | "unlike" => {
+            let Some(track) = app.current_track().cloned() else {
+                return (cli::CliResponse::err("nothing is selected"), false);
+            };
+            let currently_liked = app.is_current_liked();
+            let want_liked = command == "like";
+            if currently_liked != want_liked {
+                app.toggle_like();
+            }
+            let liked = app.is_current_liked();
+            let message = if liked {
+                format!("Liked: {} — {}", track.artist, track.title)
+            } else {
+                format!("Unliked: {} — {}", track.artist, track.title)
+            };
+            (
+                cli::CliResponse::ok_data(
+                    message,
+                    serde_json::json!({
+                        "liked": liked,
+                        "track": cli::track_value(&track),
+                    }),
+                ),
+                false,
+            )
+        }
+        "lyrics" => {
+            let Some(track) = app.current_track().cloned() else {
+                return (cli::CliResponse::err("nothing is selected"), false);
+            };
+            let same_track =
+                app.lyrics_track_id.is_some() && app.lyrics_track_id == app.current_track_id();
+            if same_track && (!app.lyrics_lines.is_empty() || app.lyrics_error.is_some()) {
+                let (message, data) = cli::lyrics_message_and_data(app);
+                return (cli::CliResponse::ok_data(message, data), false);
+            }
+            app.view_mode = app::ViewMode::Lyrics;
+            app.maybe_fetch_lyrics();
+            (
+                cli::CliResponse::ok(format!(
+                    "Fetching lyrics for {} — {} (run `lyrics` again in a moment)",
+                    track.artist, track.title
+                )),
+                false,
+            )
+        }
+        "queue" => {
+            let limit = limit.unwrap_or(50).clamp(1, 500);
+            let (message, data) = cli::queue_message_and_data(app, limit);
+            (cli::CliResponse::ok_data(message, data), false)
+        }
+        "source" => {
+            if args.is_empty() {
+                let source = cli::source_name(app.current_source);
+                return (
+                    cli::CliResponse::ok_data(
+                        format!("Source: {source}"),
+                        serde_json::json!({ "source": source }),
+                    ),
+                    false,
+                );
+            }
+            let value = args[0].to_ascii_lowercase();
+            let Some(source) = cli::parse_source(&value) else {
+                return (
+                    cli::CliResponse::err(format!(
+                        "unknown source '{value}' (try yandex, itunes, soundcloud, ytmusic, local)"
+                    )),
+                    false,
+                );
+            };
+            if source == api::Source::YandexMusic && app.token.is_empty() {
+                return (
+                    cli::CliResponse::err(
+                        "Yandex Music needs a token in ~/.config/music-player-tui/config.json",
+                    ),
+                    false,
+                );
+            }
+            app.current_source = source;
+            if source == api::Source::Local {
+                app.start_local_scan();
+            }
+            let name = cli::source_name(source);
+            (
+                cli::CliResponse::ok_data(
+                    format!("Source: {name}"),
+                    serde_json::json!({ "source": name }),
+                ),
+                false,
+            )
+        }
+        "quit" => (cli::CliResponse::ok("Player quit"), true),
+        other => (
+            cli::CliResponse::err(format!("unknown command '{other}'")),
+            false,
+        ),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Any argument switches to CLI mode; no arguments opens the TUI.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        std::process::exit(cli::run(args).await);
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -741,6 +1278,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = std::fs::create_dir_all(paths::data_dir());
 
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<app::Command>();
+    let _cli_socket = cli::start_server(cmd_tx.clone());
 
     let cfg = config::load();
     if !cfg.soundcloud_client_id.is_empty() {
@@ -789,6 +1327,7 @@ async fn main() -> anyhow::Result<()> {
     let discord = discord_rpc::DiscordRpc::new(discord_id);
 
     let mut last_progress = std::time::Instant::now();
+    let mut cli_quit = false;
     loop {
         app.maybe_fetch_lyrics();
         let mut redraw = false;
@@ -1455,6 +1994,23 @@ async fn main() -> anyhow::Result<()> {
 
         while let Ok(cmd) = cmd_rx.try_recv() {
             redraw = true;
+            let cmd = match cmd {
+                app::Command::Cli { request, reply } => {
+                    let (response, quit) = handle_cli_request(
+                        request, &mut app, &player_tx, &cmd_tx, &mpris, &discord,
+                    )
+                    .await;
+                    let _ = reply.send(response);
+                    if quit {
+                        // Give the socket task a moment to flush its reply.
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        cli_quit = true;
+                        break;
+                    }
+                    continue;
+                }
+                other => other,
+            };
             let auto_dl = match &cmd {
                 app::Command::DownloadLikedTrack(t) => Some(t.clone()),
                 _ => None,
@@ -1534,7 +2090,9 @@ async fn main() -> anyhow::Result<()> {
             let is_play = matches!(&cmd, app::Command::PlayStarted { .. });
             let is_err = matches!(&cmd, app::Command::PlayError(_));
             let is_finished = matches!(&cmd, app::Command::PlaybackFinished);
+            let is_results = matches!(&cmd, app::Command::SearchResults(_));
             app.handle_command(cmd);
+            let auto_play = is_results && app.take_pending_autoplay();
             if is_play {
                 if let Some(ref m) = mpris {
                     m.set_playing(true).await;
@@ -1592,6 +2150,19 @@ async fn main() -> anyhow::Result<()> {
                     play_track(&player_tx, &app, &cmd_tx);
                 }
             }
+
+            // `play` in CLI mode searches in the background; when the results
+            // arrive, start the first one.
+            if auto_play && app.current_track().is_some() {
+                app.is_playing = true;
+                app.loading_play = true;
+                app.note_playing();
+                cli_start_track(&app, &player_tx, &cmd_tx, &mpris, &discord).await;
+            }
+        }
+
+        if cli_quit {
+            break;
         }
 
         if redraw || last_progress.elapsed() >= std::time::Duration::from_millis(500) {
