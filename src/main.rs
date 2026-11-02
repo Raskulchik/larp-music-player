@@ -1336,7 +1336,10 @@ async fn main() -> anyhow::Result<()> {
             match event::read()? {
                 Event::Key(key) => {
                     redraw = true;
-                    if key.kind == KeyEventKind::Press {
+                    // Treat key repeats as input too. Some terminals report
+                    // held keys as `Repeat`; ignoring those makes controls
+                    // appear unresponsive outside of the arrow keys.
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                         if key.code == KeyCode::Char('c')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {
