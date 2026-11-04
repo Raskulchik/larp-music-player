@@ -48,21 +48,22 @@ pub fn downloads_dir() -> PathBuf {
 /// Result of the one-off cache relocation.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Migration {
-    /// Files relocated to the data dir.
-    pub moved: usize,
+    /// Files copied to the data dir; the legacy originals are retained.
+    pub copied: usize,
     /// Files left behind because the destination already had them.
     pub skipped: usize,
     /// True when the legacy directory is gone (migration complete).
     pub done: bool,
 }
 
-/// Move the legacy `~/.cache/music-player-tui` tree into the data dir.
+/// Copy legacy downloaded songs from `~/.cache/music-player-tui/downloads`
+/// into the current data directory.
 ///
 /// Idempotent: it can be called on every start. Files already present in the
-/// destination are never overwritten.
+/// destination are never overwritten, and the legacy originals are retained.
 pub fn migrate_legacy_cache() -> Migration {
-    let legacy = legacy_cache_dir();
-    let target = data_dir();
+    let legacy = legacy_cache_dir().join("downloads");
+    let target = downloads_dir();
     migrate_into(&legacy, &target)
 }
 
@@ -94,57 +95,44 @@ pub fn migrate_into(legacy: &Path, target: &Path) -> Migration {
             report.skipped += 1;
             continue;
         }
-        match move_path(&src, &dst) {
-            Ok(()) => report.moved += 1,
+        match copy_path(&src, &dst, &mut report) {
+            Ok(()) => {}
             Err(e) => crate::dlog!(
-                "[paths] move failed {} -> {}: {}",
+                "[paths] copy failed {} -> {}: {}",
                 src.display(),
                 dst.display(),
                 e
             ),
         }
     }
-
-    // Drop the legacy dir when it is empty; leftovers are kept for safety.
-    if let Ok(mut it) = std::fs::read_dir(legacy) {
-        if it.next().is_none() {
-            let _ = std::fs::remove_dir(legacy);
-            report.done = true;
-        }
-    }
+    report.done = true;
     report
 }
 
-/// Rename a file or directory, falling back to a recursive copy across
-/// filesystems.
-fn move_path(src: &Path, dst: &Path) -> std::io::Result<()> {
-    match std::fs::rename(src, dst) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            if src.is_dir() {
-                copy_dir(src, dst)?;
-                let _ = std::fs::remove_dir_all(src);
-            } else {
-                std::fs::copy(src, dst)?;
-                let _ = std::fs::remove_file(src);
-            }
-            Ok(())
+/// Copy a file tree without replacing existing destination files or deleting
+/// anything from the legacy cache.
+fn copy_path(src: &Path, dst: &Path, report: &mut Migration) -> std::io::Result<()> {
+    if src.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            copy_path(&entry.path(), &dst.join(entry.file_name()), report)?;
         }
+        return Ok(());
     }
-}
-
-fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if from.is_dir() {
-            copy_dir(&from, &to)?;
-        } else {
-            std::fs::copy(&from, &to)?;
-        }
+    if dst.exists() {
+        report.skipped += 1;
+        return Ok(());
     }
+    if src.file_name().and_then(|name| name.to_str()).map(|name| name.ends_with(".part")).unwrap_or(false) {
+        report.skipped += 1;
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(src, dst)?;
+    report.copied += 1;
     Ok(())
 }
 
@@ -168,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_moves_files_and_keeps_existing() {
+    fn migration_copies_files_and_keeps_both_trees() {
         let root = tmp("migrate");
         let legacy = root.join("cache");
         let target = root.join("data");
@@ -178,16 +166,17 @@ mod tests {
         std::fs::write(legacy.join("downloads/b.mp3"), b"bbb").unwrap();
 
         let report = migrate_into(&legacy, &target);
-        assert_eq!(report.moved, 2);
+        assert_eq!(report.copied, 2);
         assert!(report.done);
         assert!(target.join("a.pcm").exists());
         assert!(target.join("downloads/b.mp3").exists());
-        assert!(!legacy.exists(), "legacy dir should be removed");
+        assert!(legacy.join("a.pcm").exists(), "legacy source must be kept");
+        assert!(legacy.join("downloads/b.mp3").exists(), "legacy download must be kept");
 
         // Re-running must not duplicate or fail.
         let report2 = migrate_into(&legacy, &target);
-        assert_eq!(report2.moved, 0);
-        assert_eq!(report2.skipped, 0);
+        assert_eq!(report2.copied, 0);
+        assert_eq!(report2.skipped, 2);
     }
 
     #[test]
@@ -202,7 +191,8 @@ mod tests {
 
         let report = migrate_into(&legacy, &target);
         assert_eq!(report.skipped, 1);
-        assert_eq!(report.moved, 0);
+        assert_eq!(report.copied, 0);
         assert_eq!(std::fs::read(target.join("a.pcm")).unwrap(), b"new");
+        assert_eq!(std::fs::read(legacy.join("a.pcm")).unwrap(), b"old");
     }
 }

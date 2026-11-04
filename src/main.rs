@@ -1265,13 +1265,12 @@ async fn main() -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // One-off relocation of the old ~/.cache/music-player-tui tree into
-    // ~/.local/share/music-player-tui.
+    // Copy old downloaded songs from ~/.cache into the data library.
     let migration = paths::migrate_legacy_cache();
-    if migration.moved > 0 || migration.skipped > 0 {
+    if migration.copied > 0 || migration.skipped > 0 {
         dlog!(
-            "[paths] cache migration: moved {} files, skipped {}",
-            migration.moved,
+            "[paths] cache migration: copied {} files, skipped {}",
+            migration.copied,
             migration.skipped
         );
     }
