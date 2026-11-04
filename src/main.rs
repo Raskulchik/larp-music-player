@@ -1349,7 +1349,8 @@ async fn main() -> anyhow::Result<()> {
                             InputMode::Search
                             | InputMode::TokenInput
                             | InputMode::ClientIdInput
-                            | InputMode::NameInput => match key.code {
+                            | InputMode::NameInput
+                            | InputMode::AlbumImport => match key.code {
                                 KeyCode::Esc => app.cancel_input(),
                                 KeyCode::Enter => {
                                     let was_token_input = app.input_mode == InputMode::TokenInput;
@@ -1404,6 +1405,9 @@ async fn main() -> anyhow::Result<()> {
                                             }
                                             'n' | 'т' => {
                                                 app.start_name_input();
+                                            }
+                                            'i' | 'ш' => {
+                                                app.start_album_import();
                                             }
                                             'd' | 'в' => {
                                                 if app.view_mode == app::ViewMode::Playlists {

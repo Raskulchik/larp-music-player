@@ -500,6 +500,110 @@ pub async fn search_ytmusic(query: &str) -> anyhow::Result<Vec<Track>> {
     Ok(tracks)
 }
 
+/// Import a public album or playlist URL into a local playlist. Provider
+/// detection lives here so Yandex Music and SoundCloud can add their own
+/// album endpoints without changing the UI or database layer.
+pub async fn import_album(url: &str) -> anyhow::Result<(String, Vec<Track>)> {
+    let parsed = reqwest::Url::parse(url.trim())?;
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+
+    if host == "music.youtube.com" || host == "youtube.com" || host.ends_with(".youtube.com") {
+        import_ytmusic_album(url.trim()).await
+    } else if host == "music.yandex.ru" || host == "music.yandex.com" {
+        import_yandex_album(url.trim()).await
+    } else if host == "soundcloud.com" || host.ends_with(".soundcloud.com") {
+        import_soundcloud_album(url.trim()).await
+    } else {
+        anyhow::bail!("Unsupported album URL; use YouTube Music, Yandex Music, or SoundCloud")
+    }
+}
+
+async fn import_ytmusic_album(url: &str) -> anyhow::Result<(String, Vec<Track>)> {
+    let output = tokio::process::Command::new("yt-dlp")
+        .args([
+            "--flat-playlist",
+            "--dump-single-json",
+            "--no-warnings",
+            "--skip-download",
+            url,
+        ])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("Could not start yt-dlp: {e}"))?;
+
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("YouTube Music import failed: {}", error.trim());
+    }
+
+    let data: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow::anyhow!("Could not read yt-dlp playlist data: {e}"))?;
+    let name = data
+        .get("playlist_title")
+        .or_else(|| data.get("title"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("YouTube Music album")
+        .to_string();
+    let entries = data
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            anyhow::anyhow!("That YouTube link does not contain an album or playlist")
+        })?;
+
+    let tracks: Vec<Track> = entries
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.get("id")?.as_str()?.to_string();
+            let title = entry
+                .get("track")
+                .or_else(|| entry.get("title"))?
+                .as_str()?
+                .to_string();
+            let artist = entry
+                .get("artist")
+                .or_else(|| entry.get("uploader"))
+                .or_else(|| entry.get("channel"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown")
+                .to_string();
+            let duration_ms = entry
+                .get("duration")
+                .and_then(|v| v.as_f64())
+                .map(|seconds| (seconds * 1000.0) as u64);
+            let artwork_url = entry
+                .get("thumbnail")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            Some(Track {
+                id,
+                title,
+                artist,
+                source: Source::YouTubeMusic,
+                preview_url: None,
+                artwork_url,
+                duration_ms,
+                album: Some(name.clone()),
+                year: None,
+            })
+        })
+        .collect();
+
+    if tracks.is_empty() {
+        anyhow::bail!("No tracks found in that YouTube Music album or playlist");
+    }
+    Ok((name, tracks))
+}
+
+async fn import_yandex_album(_url: &str) -> anyhow::Result<(String, Vec<Track>)> {
+    anyhow::bail!("Yandex Music album import is not implemented yet")
+}
+
+async fn import_soundcloud_album(_url: &str) -> anyhow::Result<(String, Vec<Track>)> {
+    anyhow::bail!("SoundCloud album import is not implemented yet")
+}
+
 fn collect_ytm_tracks(value: &serde_json::Value, out: &mut Vec<Track>) {
     match value {
         serde_json::Value::Object(map) => {

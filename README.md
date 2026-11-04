@@ -25,3 +25,9 @@ running TUI over a Unix socket. Library commands (`search`, `liked`,
 without a running player.
 
 Use `larp-music-player --help` for the full command list and examples.
+
+## Import an album
+
+Open the playlists view and press `Shift+I`, then paste a YouTube Music album or
+playlist URL. The tracks are saved as a local playlist. Yandex Music and
+SoundCloud URL handling is scaffolded for a future importer.

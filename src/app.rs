@@ -5,6 +5,11 @@ use tokio::sync::mpsc;
 pub enum Command {
     SearchResults(Vec<Track>),
     SearchError(String),
+    AlbumImportResults {
+        name: String,
+        tracks: Vec<Track>,
+    },
+    AlbumImportError(String),
     PlayStarted {
         actual_duration_ms: Option<u64>,
     },
@@ -69,6 +74,7 @@ pub enum InputMode {
     ViewSelect,
     PlaylistSelect,
     NameInput,
+    AlbumImport,
     Help,
 }
 
@@ -144,6 +150,7 @@ pub struct App {
     pub playlists: Vec<Playlist>,
     pub active_playlist_id: Option<i64>,
     pub name_input: String,
+    pub album_import_input: String,
     pub update_available: Option<String>,
     /// Listening stats accumulator (wall-clock, immune to seeking).
     listen_accum_ms: u64,
@@ -236,6 +243,7 @@ impl App {
             playlists: Vec::new(),
             active_playlist_id: None,
             name_input: String::new(),
+            album_import_input: String::new(),
             update_available: None,
             listen_accum_ms: 0,
             listen_mark: None,
@@ -1026,6 +1034,35 @@ impl App {
         self.status_message = "Enter playlist name, Enter to create".to_string();
     }
 
+    pub fn start_album_import(&mut self) {
+        self.album_import_input.clear();
+        self.input_mode = InputMode::AlbumImport;
+        self.status_message = "Paste a YouTube Music, Yandex Music, or SoundCloud album URL".into();
+    }
+
+    fn submit_album_import(&mut self) {
+        let url = self.album_import_input.trim().to_string();
+        if url.is_empty() {
+            self.status_message = "Album URL cannot be empty".into();
+            return;
+        }
+        self.input_mode = InputMode::Normal;
+        self.album_import_input.clear();
+        self.loading = true;
+        self.status_message = "Importing album…".into();
+        let tx = self.cmd_tx.clone();
+        tokio::spawn(async move {
+            match api::import_album(&url).await {
+                Ok((name, tracks)) => {
+                    let _ = tx.send(Command::AlbumImportResults { name, tracks });
+                }
+                Err(e) => {
+                    let _ = tx.send(Command::AlbumImportError(e.to_string()));
+                }
+            }
+        });
+    }
+
     pub fn confirm_playlist_add(&mut self) {
         self.input_mode = InputMode::Normal;
         let Some(pl) = self.playlists.get(self.select_index).cloned() else {
@@ -1053,6 +1090,7 @@ impl App {
             InputMode::TokenInput => self.token.push(c),
             InputMode::ClientIdInput => self.sc_client_id.push(c),
             InputMode::NameInput => self.name_input.push(c),
+            InputMode::AlbumImport => self.album_import_input.push(c),
             _ => {}
         }
     }
@@ -1070,6 +1108,9 @@ impl App {
             }
             InputMode::NameInput => {
                 self.name_input.pop();
+            }
+            InputMode::AlbumImport => {
+                self.album_import_input.pop();
             }
             _ => {}
         }
@@ -1111,6 +1152,7 @@ impl App {
             InputMode::ViewSelect => self.confirm_view_select(),
             InputMode::PlaylistSelect => self.confirm_playlist_add(),
             InputMode::NameInput => self.create_playlist(),
+            InputMode::AlbumImport => self.submit_album_import(),
             InputMode::Help => self.toggle_help(),
             InputMode::Normal => {}
         }
@@ -1140,6 +1182,10 @@ impl App {
             }
             InputMode::NameInput => {
                 self.name_input.clear();
+                self.input_mode = InputMode::Normal;
+            }
+            InputMode::AlbumImport => {
+                self.album_import_input.clear();
                 self.input_mode = InputMode::Normal;
             }
             InputMode::Help => {
@@ -1263,6 +1309,31 @@ impl App {
                     self.status_message =
                         "Auto-extract failed. Enter SoundCloud client_id:".to_string();
                 }
+            }
+            Command::AlbumImportResults { name, tracks } => {
+                self.loading = false;
+                let playlist_id = match self.db.create_playlist(&name) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        self.status_message = format!("Could not create album playlist: {e}");
+                        return;
+                    }
+                };
+                for track in &tracks {
+                    if let Err(e) = self.db.add_to_playlist(playlist_id, track) {
+                        self.status_message = format!("Album import stopped: {e}");
+                        self.load_playlists();
+                        return;
+                    }
+                }
+                self.enter_playlists();
+                self.open_playlist(playlist_id);
+                self.status_message =
+                    format!("Imported album \"{name}\" ({} tracks)", tracks.len());
+            }
+            Command::AlbumImportError(e) => {
+                self.loading = false;
+                self.status_message = format!("Album import failed: {e}");
             }
             Command::PlayStarted { actual_duration_ms } => {
                 self.is_playing = true;

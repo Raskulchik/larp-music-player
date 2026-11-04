@@ -146,6 +146,7 @@ fn draw_help(f: &mut Frame, _app: &App) {
         ("Shift+A", "add track to playlist"),
         ("Shift+N", "new playlist"),
         ("Shift+D", "delete playlist / remove from playlist"),
+        ("Shift+I", "import album from URL"),
         ("   /", "search"),
         ("Tab", "views (search/liked/lyrics/playlists/stats/local)"),
         (" t", "source"),
@@ -333,6 +334,11 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         }
         InputMode::NameInput => {
             let text = format!("  new playlist: {}█", app.name_input);
+            let widget = Paragraph::new(text).style(Style::default().fg(Color::Yellow));
+            f.render_widget(widget, area);
+        }
+        InputMode::AlbumImport => {
+            let text = format!("  album URL: {}█", app.album_import_input);
             let widget = Paragraph::new(text).style(Style::default().fg(Color::Yellow));
             f.render_widget(widget, area);
         }
