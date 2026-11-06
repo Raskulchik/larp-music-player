@@ -1051,8 +1051,9 @@ impl App {
         self.loading = true;
         self.status_message = "Importing album…".into();
         let tx = self.cmd_tx.clone();
+        let token = self.token.clone();
         tokio::spawn(async move {
-            match api::import_album(&url).await {
+            match api::import_album(&url, &token).await {
                 Ok((name, tracks)) => {
                     let _ = tx.send(Command::AlbumImportResults { name, tracks });
                 }

@@ -503,14 +503,14 @@ pub async fn search_ytmusic(query: &str) -> anyhow::Result<Vec<Track>> {
 /// Import a public album or playlist URL into a local playlist. Provider
 /// detection lives here so Yandex Music and SoundCloud can add their own
 /// album endpoints without changing the UI or database layer.
-pub async fn import_album(url: &str) -> anyhow::Result<(String, Vec<Track>)> {
+pub async fn import_album(url: &str, yandex_token: &str) -> anyhow::Result<(String, Vec<Track>)> {
     let parsed = reqwest::Url::parse(url.trim())?;
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
 
     if host == "music.youtube.com" || host == "youtube.com" || host.ends_with(".youtube.com") {
         import_ytmusic_album(url.trim()).await
     } else if host == "music.yandex.ru" || host == "music.yandex.com" {
-        import_yandex_album(url.trim()).await
+        import_yandex_album(url.trim(), yandex_token).await
     } else if host == "soundcloud.com" || host.ends_with(".soundcloud.com") {
         import_soundcloud_album(url.trim()).await
     } else {
@@ -596,8 +596,285 @@ async fn import_ytmusic_album(url: &str) -> anyhow::Result<(String, Vec<Track>)>
     Ok((name, tracks))
 }
 
-async fn import_yandex_album(_url: &str) -> anyhow::Result<(String, Vec<Track>)> {
-    anyhow::bail!("Yandex Music album import is not implemented yet")
+enum YandexCollection {
+    Album(String),
+    Playlist(String, String),
+    SharedPlaylist(String),
+}
+
+fn parse_yandex_collection_url(url: &str) -> anyhow::Result<YandexCollection> {
+    let parsed = reqwest::Url::parse(url)?;
+    let segments: Vec<_> = parsed.path_segments().into_iter().flatten().collect();
+    if segments.len() >= 2 && segments[0] == "album" {
+        let id = segments[1];
+        if !id.chars().all(|c| c.is_ascii_digit()) {
+            anyhow::bail!("Yandex album URL has an invalid album id");
+        }
+        return Ok(YandexCollection::Album(id.to_string()));
+    }
+
+    if segments.len() >= 4 && segments[0] == "users" && segments[2] == "playlists" {
+        let owner = segments[1].to_string();
+        let playlist_id = segments[3].to_string();
+        if playlist_id.chars().all(|c| c.is_ascii_digit()) {
+            return Ok(YandexCollection::Playlist(owner, playlist_id));
+        }
+        return Ok(YandexCollection::SharedPlaylist(playlist_id));
+    }
+    if segments.len() >= 2 && segments[0] == "playlists" {
+        if segments.len() >= 3 && !segments[2].is_empty() {
+            return Ok(YandexCollection::Playlist(
+                segments[1].to_string(),
+                segments[2].to_string(),
+            ));
+        }
+        return Ok(YandexCollection::SharedPlaylist(segments[1].to_string()));
+    }
+
+    anyhow::bail!("Yandex URL must point to an album or a playlist")
+}
+
+async fn import_yandex_album(url: &str, token: &str) -> anyhow::Result<(String, Vec<Track>)> {
+    let clean_token: String = token.chars().take_while(|&c| c != '&').collect();
+    if clean_token.trim().is_empty() {
+        anyhow::bail!("Yandex Music import requires an OAuth token; enter it with / first");
+    }
+
+    let collection = parse_yandex_collection_url(url)?;
+    let (endpoint, fallback_name): (Vec<String>, String) = match &collection {
+        YandexCollection::Album(id) => (
+            vec!["albums".into(), id.clone(), "with-tracks".into()],
+            "Yandex Music album".to_string(),
+        ),
+        YandexCollection::Playlist(owner, kind) => (
+            {
+                let user_id = resolve_yandex_user_id(owner, url, &clean_token).await;
+                vec!["users".into(), user_id, "playlists".into(), kind.clone()]
+            },
+            "Yandex Music playlist".to_string(),
+        ),
+        YandexCollection::SharedPlaylist(id) => (
+            vec!["playlist".into(), id.clone()],
+            "Yandex Music playlist".to_string(),
+        ),
+    };
+    let result = yandex_collection_request(&endpoint, &clean_token).await?;
+    let name = result
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .filter(|title| !title.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or(fallback_name);
+    let fallback_artist = result
+        .get("artists")
+        .and_then(serde_json::Value::as_array)
+        .map(|artists| yandex_artist_names(artists))
+        .filter(|artists| !artists.is_empty());
+
+    let mut tracks = Vec::new();
+    match &collection {
+        YandexCollection::Album(_) => {
+            if let Some(volumes) = result.get("volumes").and_then(serde_json::Value::as_array) {
+                for volume in volumes {
+                    collect_yandex_tracks(volume, &name, fallback_artist.as_deref(), &mut tracks);
+                }
+            }
+            if tracks.is_empty() {
+                if let Some(items) = result.get("tracks") {
+                    collect_yandex_tracks(items, &name, fallback_artist.as_deref(), &mut tracks);
+                }
+            }
+        }
+        YandexCollection::Playlist(_, _) | YandexCollection::SharedPlaylist(_) => {
+            if let Some(items) = result.get("tracks") {
+                collect_yandex_tracks(items, &name, fallback_artist.as_deref(), &mut tracks);
+            }
+        }
+    }
+
+    if tracks.is_empty() {
+        anyhow::bail!("Yandex Music returned no tracks for {name}");
+    }
+    Ok((name, tracks))
+}
+
+async fn yandex_collection_request(
+    endpoint: &[String],
+    token: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let mut url = reqwest::Url::parse(&format!("{YM_API}/"))?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("Could not build Yandex Music API URL"))?
+        .extend(endpoint.iter().map(String::as_str));
+
+    let client = reqwest::Client::new();
+    let mut request = client
+        .get(url)
+        .header("Authorization", format!("OAuth {token}"));
+    if endpoint
+        .first()
+        .is_some_and(|part| part == "users" || part == "playlist")
+    {
+        request = request.query(&[("resumeStream", "false"), ("richTracks", "false")]);
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "Yandex Music HTTP {status}: {}",
+            &body[..body.len().min(400)]
+        );
+    }
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|error| anyhow::anyhow!("Could not parse Yandex Music response: {error}"))?;
+    value
+        .get("result")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Yandex Music response has no result"))
+}
+
+async fn resolve_yandex_user_id(owner: &str, playlist_url: &str, token: &str) -> String {
+    if owner.chars().all(|c| c.is_ascii_digit()) {
+        return owner.to_string();
+    }
+
+    if let Ok(response) = reqwest::get(playlist_url).await {
+        let final_url = response.url().clone();
+        let final_segments: Vec<_> = final_url.path_segments().into_iter().flatten().collect();
+        if final_segments.len() >= 2 && final_segments[0] == "playlists" {
+            return final_segments[1].to_string();
+        }
+        if let Ok(body) = response.text().await {
+            if let Ok(pattern) = regex::Regex::new(r#""uid"\s*:\s*(\d+)"#) {
+                if let Some(uid) = pattern.captures(&body).and_then(|capture| capture.get(1)) {
+                    return uid.as_str().to_string();
+                }
+            }
+        }
+    }
+
+    if let Ok(response) = reqwest::Client::new()
+        .get(format!("{YM_API}/account/status"))
+        .header("Authorization", format!("OAuth {token}"))
+        .send()
+        .await
+    {
+        if let Ok(value) = response.json::<serde_json::Value>().await {
+            let uid = value
+                .pointer("/result/account/uid")
+                .or_else(|| value.pointer("/result/uid"))
+                .and_then(serde_json::Value::as_i64);
+            if let Some(uid) = uid {
+                return uid.to_string();
+            }
+        }
+    }
+    owner.to_string()
+}
+
+fn collect_yandex_tracks(
+    value: &serde_json::Value,
+    album_name: &str,
+    fallback_artist: Option<&str>,
+    out: &mut Vec<Track>,
+) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_yandex_tracks(item, album_name, fallback_artist, out);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            if let Some(track) = object.get("track") {
+                if let Some(parsed) = yandex_track(track, album_name, fallback_artist) {
+                    out.push(parsed);
+                }
+            } else if let Some(parsed) = yandex_track(value, album_name, fallback_artist) {
+                out.push(parsed);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn yandex_track(
+    value: &serde_json::Value,
+    fallback_album: &str,
+    fallback_artist: Option<&str>,
+) -> Option<Track> {
+    let id_value = value.get("id")?;
+    let id = id_value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| id_value.as_i64().map(|id| id.to_string()))?;
+    let title = value.get("title")?.as_str()?.trim().to_string();
+    if title.is_empty() {
+        return None;
+    }
+
+    let artists = value
+        .get("artists")
+        .and_then(serde_json::Value::as_array)
+        .map(|artists| yandex_artist_names(artists))
+        .filter(|artists| !artists.is_empty())
+        .or_else(|| fallback_artist.map(str::to_string))
+        .unwrap_or_else(|| "Unknown".to_string());
+    let album = value
+        .get("albums")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|albums| albums.first())
+        .and_then(|album| album.get("title"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|album| !album.is_empty())
+        .unwrap_or(fallback_album)
+        .to_string();
+    let artwork_url = value
+        .get("coverUri")
+        .or_else(|| value.get("cover_uri"))
+        .and_then(serde_json::Value::as_str)
+        .map(yandex_cover_url);
+    let duration_ms = value
+        .get("durationMs")
+        .or_else(|| value.get("duration_ms"))
+        .and_then(serde_json::Value::as_u64);
+    let year = value
+        .get("year")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|year| u16::try_from(year).ok());
+
+    Some(Track {
+        id,
+        title,
+        artist: artists,
+        source: Source::YandexMusic,
+        preview_url: None,
+        artwork_url,
+        duration_ms,
+        album: Some(album),
+        year,
+    })
+}
+
+fn yandex_artist_names(artists: &[serde_json::Value]) -> String {
+    artists
+        .iter()
+        .filter_map(|artist| artist.get("name").and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn yandex_cover_url(uri: &str) -> String {
+    let sized = uri.replace("%%", "1000x1000");
+    if sized.starts_with("//") {
+        format!("https:{sized}")
+    } else if sized.starts_with("http://") || sized.starts_with("https://") {
+        sized
+    } else {
+        format!("https://{sized}")
+    }
 }
 
 async fn import_soundcloud_album(_url: &str) -> anyhow::Result<(String, Vec<Track>)> {

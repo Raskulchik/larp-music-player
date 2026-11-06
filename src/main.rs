@@ -169,28 +169,22 @@ fn local_liked_path(app: &App) -> Option<std::path::PathBuf> {
     }
 }
 
-fn start_update_check(cfg: &config::Config, cmd_tx: &mpsc::UnboundedSender<app::Command>) {
+fn start_update_check(cfg: &mut config::Config, cmd_tx: &mpsc::UnboundedSender<app::Command>) {
     let now = config::now_secs();
     // Check at most once every 24h.
     if now.saturating_sub(cfg.last_update_check) < 24 * 60 * 60 {
         return;
     }
-    let mut fresh = config::Config {
-        yandex_token: String::new(),
-        soundcloud_client_id: String::new(),
-        discord_client_id: cfg.discord_client_id.clone(),
-        lastfm_api_key: cfg.lastfm_api_key.clone(),
-        liked_shuffle: cfg.liked_shuffle,
-        last_update_check: now,
-    };
+    let mut updated = cfg.clone();
+    updated.last_update_check = now;
     let saved = cmd_tx.clone();
     tokio::spawn(async move {
         if let Some((tag, url)) = update::check().await {
             let _ = saved.send(app::Command::UpdateAvailable { tag, url });
         }
     });
-    config::save(&fresh);
-    fresh.last_update_check = now;
+    config::save(&updated);
+    cfg.last_update_check = now;
 }
 
 fn start_download_liked(app: &App, cmd_tx: &mpsc::UnboundedSender<app::Command>, silent: bool) {
@@ -1279,7 +1273,7 @@ async fn main() -> anyhow::Result<()> {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<app::Command>();
     let _cli_socket = cli::start_server(cmd_tx.clone());
 
-    let cfg = config::load();
+    let mut cfg = config::load();
     if !cfg.soundcloud_client_id.is_empty() {
         api::set_sc_client_id(&cfg.soundcloud_client_id);
     }
@@ -1291,7 +1285,7 @@ async fn main() -> anyhow::Result<()> {
     );
     start_download_liked(&app, &cmd_tx, true);
     start_liked_backfill(&app, &cmd_tx);
-    start_update_check(&cfg, &cmd_tx);
+    start_update_check(&mut cfg, &cmd_tx);
     let (player_tx, player_handle) = player::start(cmd_tx.clone());
 
     {
