@@ -192,17 +192,45 @@ fn start_download_liked(app: &App, cmd_tx: &mpsc::UnboundedSender<app::Command>,
         Ok(t) => t,
         Err(_) => return,
     };
-    if liked.is_empty() {
+    start_download_tracks(liked, &app.token, cmd_tx, silent);
+}
+
+fn start_download_playlist(app: &App, cmd_tx: &mpsc::UnboundedSender<app::Command>) {
+    if !app.playlists_view_open() {
+        return;
+    }
+    if app.download_liked_progress.is_some() {
+        return;
+    }
+    if app.tracks.is_empty() {
+        let _ = cmd_tx.send(app::Command::Status("This playlist is empty".into()));
+        return;
+    }
+    let name = app.playlist_name().unwrap_or_else(|| "playlist".into());
+    let _ = cmd_tx.send(app::Command::Status(format!(
+        "Downloading playlist: {name} ({} tracks)",
+        app.tracks.len()
+    )));
+    start_download_tracks(app.tracks.clone(), &app.token, cmd_tx, false);
+}
+
+fn start_download_tracks(
+    tracks: Vec<api::Track>,
+    token: &str,
+    cmd_tx: &mpsc::UnboundedSender<app::Command>,
+    silent: bool,
+) {
+    if tracks.is_empty() {
         return;
     }
     let tx = cmd_tx.clone();
-    let token = app.token.clone();
+    let token = token.to_string();
     tokio::spawn(async move {
         let _ = tokio::fs::create_dir_all(downloads_dir()).await;
-        let total = liked.len();
+        let total = tracks.len();
         let mut downloaded = 0u32;
         let mut failed = 0u32;
-        for (i, track) in liked.iter().enumerate() {
+        for (i, track) in tracks.iter().enumerate() {
             if !silent {
                 let _ = tx.send(app::Command::DownloadLikedProgress {
                     current: i + 1,
@@ -217,6 +245,9 @@ fn start_download_liked(app: &App, cmd_tx: &mpsc::UnboundedSender<app::Command>,
             let filename = sanitize_filename(&format!("{} - {}.mp3", track.artist, track.title));
             let dest = downloads_dir().join(&filename);
             if dest.exists() {
+                if !tags::has_cover(&dest) {
+                    tag_downloaded(track, &dest, &token).await;
+                }
                 downloaded += 1;
                 continue;
             }
@@ -235,7 +266,7 @@ fn start_download_liked(app: &App, cmd_tx: &mpsc::UnboundedSender<app::Command>,
             };
             match result {
                 Ok(()) => {
-                    tag_downloaded(&track, &dest).await;
+                    tag_downloaded(&track, &dest, &token).await;
                     downloaded += 1;
                 }
                 Err(_) => failed += 1,
@@ -468,15 +499,40 @@ fn start_radio(app: &App, cmd_tx: &mpsc::UnboundedSender<app::Command>, api_key:
     });
 }
 
-async fn tag_downloaded(track: &api::Track, dest: &std::path::Path) {
+async fn tag_downloaded(track: &api::Track, dest: &std::path::Path, token: &str) {
     let artist = track.artist.clone();
     let title = track.title.clone();
     let meta = api::get_mb_metadata(&artist, &title).await.ok().flatten();
+    let fetched_meta = if track.artwork_url.is_none() {
+        let extra = (track.source == api::Source::YandexMusic).then_some(token);
+        api::get_meta(track.source, &track.id, extra).await
+    } else {
+        None
+    };
+    let artwork_url = track.artwork_url.as_deref().or_else(|| {
+        fetched_meta
+            .as_ref()
+            .and_then(|meta| meta.artwork_url.as_deref())
+    });
+    let artwork = if let Some(url) = artwork_url {
+        match reqwest::Client::new().get(url).send().await {
+            Ok(response) if response.status().is_success() => match response.bytes().await {
+                Ok(bytes) if !bytes.is_empty() && bytes.len() <= 15 * 1024 * 1024 => {
+                    Some(bytes.to_vec())
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    } else {
+        None
+    };
     tags::tag_track_file(
         dest,
         track,
         meta.as_ref().and_then(|m| m.album.as_deref()),
         meta.as_ref().and_then(|m| m.year),
+        artwork,
     );
 }
 
@@ -1401,6 +1457,11 @@ async fn main() -> anyhow::Result<()> {
                                             }
                                             'i' | 'ш' => {
                                                 app.start_album_import();
+                                            }
+                                            'w' | 'ц' => {
+                                                if app.playlists_view_open() {
+                                                    start_download_playlist(&app, &cmd_tx);
+                                                }
                                             }
                                             'd' | 'в' => {
                                                 if app.view_mode == app::ViewMode::Playlists {

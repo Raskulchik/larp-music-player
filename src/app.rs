@@ -1379,12 +1379,12 @@ impl App {
             }
             Command::DownloadLikedProgress { current, total } => {
                 self.download_liked_progress = Some((current, total));
-                self.status_message = format!("Downloading liked: {}/{}", current, total);
+                self.status_message = format!("Downloading tracks: {}/{}", current, total);
             }
             Command::DownloadLikedDone { downloaded, failed } => {
                 self.download_liked_progress = None;
                 self.status_message =
-                    format!("Download complete: {} ok, {} failed", downloaded, failed);
+                    format!("Download complete: {downloaded} ok, {failed} failed");
             }
             Command::DownloadLikedTrack(_) => {}
             Command::DownloadLikedTrackDone { title, ok } => {
@@ -1491,6 +1491,12 @@ impl App {
                 artwork_url,
             } => {
                 let _ = self.db.update_liked_meta(
+                    &source,
+                    &track_id,
+                    duration_ms,
+                    artwork_url.as_deref(),
+                );
+                let _ = self.db.update_playlist_track_meta(
                     &source,
                     &track_id,
                     duration_ms,

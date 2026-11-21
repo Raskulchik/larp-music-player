@@ -146,6 +146,7 @@ fn draw_help(f: &mut Frame, _app: &App) {
         ("Shift+A", "add track to playlist"),
         ("Shift+N", "new playlist"),
         ("Shift+D", "delete playlist / remove from playlist"),
+        ("Shift+W", "download every track in the open playlist"),
         ("Shift+I", "import album from URL"),
         ("   /", "search"),
         ("Tab", "views (search/liked/lyrics/playlists/stats/local)"),

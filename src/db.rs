@@ -189,8 +189,27 @@ impl Database {
         let source_str = source_str(&source);
         let dur = duration_ms.map(|d| d as i64);
         self.conn.execute(
-            "UPDATE liked SET duration_ms = ?1, artwork_url = ?2 WHERE source = ?3 AND track_id = ?4",
+            "UPDATE liked SET duration_ms = COALESCE(?1, duration_ms), artwork_url = COALESCE(?2, artwork_url) WHERE source = ?3 AND track_id = ?4",
             params![dur, artwork_url, source_str, track_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_playlist_track_meta(
+        &self,
+        source: &Source,
+        track_id: &str,
+        duration_ms: Option<u64>,
+        artwork_url: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let source_str = source_str(source);
+        let duration_ms = duration_ms.map(|duration| duration as i64);
+        self.conn.execute(
+            "UPDATE playlist_tracks
+             SET duration_ms = COALESCE(?1, duration_ms),
+                 artwork_url = COALESCE(?2, artwork_url)
+             WHERE source = ?3 AND track_id = ?4",
+            params![duration_ms, artwork_url, source_str, track_id],
         )?;
         Ok(())
     }
