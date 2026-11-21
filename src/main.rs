@@ -245,8 +245,18 @@ fn start_download_tracks(
             let filename = sanitize_filename(&format!("{} - {}.mp3", track.artist, track.title));
             let dest = downloads_dir().join(&filename);
             if dest.exists() {
-                if !tags::has_cover(&dest) {
-                    tag_downloaded(track, &dest, &token).await;
+                let artwork_url = if tags::has_cover(&dest) {
+                    artwork_for_track(track, &token).await
+                } else {
+                    tag_downloaded(track, &dest, &token).await
+                };
+                if artwork_url.is_some() {
+                    let _ = tx.send(app::Command::MetaUpdated {
+                        source: track.source,
+                        track_id: track.id.clone(),
+                        duration_ms: track.duration_ms,
+                        artwork_url,
+                    });
                 }
                 downloaded += 1;
                 continue;
@@ -266,7 +276,15 @@ fn start_download_tracks(
             };
             match result {
                 Ok(()) => {
-                    tag_downloaded(&track, &dest, &token).await;
+                    let artwork_url = tag_downloaded(&track, &dest, &token).await;
+                    if artwork_url.is_some() {
+                        let _ = tx.send(app::Command::MetaUpdated {
+                            source: track.source,
+                            track_id: track.id.clone(),
+                            duration_ms: track.duration_ms,
+                            artwork_url,
+                        });
+                    }
                     downloaded += 1;
                 }
                 Err(_) => failed += 1,
@@ -307,7 +325,9 @@ fn artwork_is_big(source: api::Source, url: Option<&str>) -> bool {
         None => return false,
     };
     match source {
-        api::Source::YouTubeMusic => u.contains("w1080") || u.contains("hq720") || !u.contains("w"),
+        api::Source::YouTubeMusic => {
+            u.contains("w1080") || u.contains("hq720") || u.contains("maxresdefault")
+        }
         api::Source::ITunes => u.contains("600x600bb"),
         api::Source::SoundCloud => u.contains("t500x500"),
         api::Source::YandexMusic => u.contains("1000x1000"),
@@ -499,22 +519,22 @@ fn start_radio(app: &App, cmd_tx: &mpsc::UnboundedSender<app::Command>, api_key:
     });
 }
 
-async fn tag_downloaded(track: &api::Track, dest: &std::path::Path, token: &str) {
+async fn artwork_for_track(track: &api::Track, token: &str) -> Option<String> {
+    if let Some(url) = track.artwork_url.as_ref().filter(|url| !url.is_empty()) {
+        return Some(url.clone());
+    }
+    let extra = (track.source == api::Source::YandexMusic).then_some(token);
+    api::get_meta(track.source, &track.id, extra)
+        .await
+        .and_then(|meta| meta.artwork_url)
+}
+
+async fn tag_downloaded(track: &api::Track, dest: &std::path::Path, token: &str) -> Option<String> {
     let artist = track.artist.clone();
     let title = track.title.clone();
     let meta = api::get_mb_metadata(&artist, &title).await.ok().flatten();
-    let fetched_meta = if track.artwork_url.is_none() {
-        let extra = (track.source == api::Source::YandexMusic).then_some(token);
-        api::get_meta(track.source, &track.id, extra).await
-    } else {
-        None
-    };
-    let artwork_url = track.artwork_url.as_deref().or_else(|| {
-        fetched_meta
-            .as_ref()
-            .and_then(|meta| meta.artwork_url.as_deref())
-    });
-    let artwork = if let Some(url) = artwork_url {
+    let artwork_url = artwork_for_track(track, token).await;
+    let artwork = if let Some(url) = artwork_url.as_deref() {
         match reqwest::Client::new().get(url).send().await {
             Ok(response) if response.status().is_success() => match response.bytes().await {
                 Ok(bytes) if !bytes.is_empty() && bytes.len() <= 15 * 1024 * 1024 => {
@@ -534,6 +554,7 @@ async fn tag_downloaded(track: &api::Track, dest: &std::path::Path, token: &str)
         meta.as_ref().and_then(|m| m.year),
         artwork,
     );
+    artwork_url
 }
 
 fn track_idx_at(app: &App, track_area: &Rect, y: u16) -> Option<usize> {
@@ -2152,7 +2173,21 @@ async fn main() -> anyhow::Result<()> {
             let is_err = matches!(&cmd, app::Command::PlayError(_));
             let is_finished = matches!(&cmd, app::Command::PlaybackFinished);
             let is_results = matches!(&cmd, app::Command::SearchResults(_));
+            let refresh_rpc_art = match &cmd {
+                app::Command::MetaUpdated {
+                    source,
+                    track_id,
+                    artwork_url: Some(_),
+                    ..
+                } => app
+                    .current_track()
+                    .is_some_and(|track| track.source == *source && track.id == *track_id),
+                _ => false,
+            };
             app.handle_command(cmd);
+            if refresh_rpc_art {
+                discord_set(&discord, &app);
+            }
             let auto_play = is_results && app.take_pending_autoplay();
             if is_play {
                 if let Some(ref m) = mpris {
@@ -2160,6 +2195,11 @@ async fn main() -> anyhow::Result<()> {
                 }
                 discord_set(&discord, &app);
                 if let Some(t) = app.current_track() {
+                    if t.source != api::Source::Local
+                        && !artwork_is_big(t.source, t.artwork_url.as_deref())
+                    {
+                        fetch_meta_into(&cmd_tx, t.clone(), &app);
+                    }
                     let tx = cmd_tx.clone();
                     let artist = t.artist.clone();
                     let title = t.title.clone();
